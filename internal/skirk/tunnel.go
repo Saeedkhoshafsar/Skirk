@@ -247,7 +247,21 @@ func controlIsFresh(info ObjectInfo, startedAt time.Time) bool {
 }
 
 func (t *Tunnel) markActivity() {
-	atomic.StoreInt64(&t.lastActivityNS, time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&t.lastActivityNS, now)
+	// v0.1.53: keep burst-poll alive on receiver-dominated traffic.
+	//
+	// Previously, the burst-poll window was anchored to lastUploadNS only,
+	// so a download-heavy session (e.g. a long file transfer where the
+	// client sends a single GET and then receives many megabytes) would
+	// fall back to the slow poll cadence after BurstPollWindow elapsed
+	// since the last upload, even while data was still actively being
+	// received. Refreshing lastUploadNS on any frame activity keeps the
+	// burst path warm as long as data is flowing in either direction,
+	// which directly cuts tail latency on bulk downloads without changing
+	// the idle behaviour (burst-poll still disengages once activity stops
+	// for BurstPollWindow + openPollWarmWindow).
+	atomic.StoreInt64(&t.lastUploadNS, now)
 }
 
 func (t *Tunnel) markUpload() {

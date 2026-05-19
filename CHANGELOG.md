@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.1.53 - 2026-05-19
+
+### Throughput and quota multiplication
+
+- **Multi-mailbox striping (opt-in)**: added `drive.extra_mailboxes` to the
+  config so a tunnel can split traffic across multiple independent Google
+  Drive mailboxes (each with its own OAuth refresh token / access token /
+  token_command and optional folder). Lane assignment is deterministic
+  (FNV-1a of the object name modulo pool size) so client and exit reach
+  the same mailbox without any negotiation. Each mailbox keeps its own
+  adaptive backoff: a 429 on one mailbox no longer stalls the others,
+  which is exactly the property that turns extra accounts into a linear
+  quota multiplier in practice. Up to 15 extra mailboxes are accepted (16
+  total). The single-mailbox path is byte-for-byte unchanged: omitting
+  `extra_mailboxes` leaves behaviour identical to v0.1.52.
+- New `MailboxPool` type (`internal/skirk/mailbox_pool.go`) implements
+  every interface the mux already type-asserts on `Data` — `BlobStore`,
+  `ObjectPutStore`, `ObjectPutIDStore`, `ObjectIDReserveStore`,
+  `ObjectIDStore`, `RangeObjectStore`, `FreshListStore`,
+  `FreshListStatusStore`, `FreshListPageStatusStore`,
+  `FreshListContainsPageStatusStore`, `ChangeFeedStore`, and the
+  `WaitForDriveQuota` quota-wait contract — so wrapping is transparent
+  to the rest of the codebase. Reserved fileIDs are tracked in a bounded
+  FIFO index (16k entries) so subsequent PutObjectWithID / GetByID hit
+  the right mailbox in O(1); on miss we fan out across mailboxes and
+  treat 404/NotFound as "object lives in another mailbox", not as a
+  real failure.
+- Added `BlobStoreFromConfig` helper so the eight `cmd/skirk` entry
+  points that currently call `StoresFromConfig` can adopt multi-mailbox
+  by changing a single construction site each. The helper returns a
+  `func()` cleanup that closes the primary token source and every extra
+  mailbox token source so the OAuth-refresh goroutines do not outlive
+  the tunnel (matches the v0.1.52 single-mailbox `Close()` discipline).
+
+### Connection-pool throughput
+
+- Bumped HTTP transport pool limits from 256/64 to 512/128 (max idle
+  conns / per-host) and idle timeout from 90s → 120s. With multi-mailbox
+  active each mailbox warms its own TLS sessions against the same Google
+  host, and the old per-host cap was the easiest way to starve mux
+  workers of pre-warmed connections. Costs ~1.5 KiB of kernel buffer per
+  extra idle connection, which is well within the desktop/server
+  profile's existing 256 MiB mux buffer budget.
+- Set explicit `WriteBufferSize` / `ReadBufferSize` (64 KiB each) on the
+  HTTP/1 transport and `MaxReadFrameSize = 1 MiB` on the HTTP/2 fallback
+  transport. Larger socket buffers cut syscall fragmentation on bulk
+  Drive media transfers, and the larger H2 frame ceiling lets a single
+  Drive media download stream avoid stalling on WINDOW_UPDATE round
+  trips.
+
+### Burst-poll keeps up with download-only traffic
+
+- `markActivity` now also refreshes `lastUploadNS`, not just
+  `lastActivityNS`. Previously a download-dominated session (e.g. a
+  multi-megabyte file transfer where the client sends one GET and then
+  only receives data) would silently drop out of burst-poll cadence
+  after `BurstPollWindow` elapsed since the last *upload* even while
+  data was still actively being received. Refreshing on any frame
+  activity keeps the fast poll loop engaged for as long as data is
+  flowing in either direction; idle behaviour is unchanged because the
+  window still expires once activity itself stops.
+
+### Tests
+
+- New `internal/skirk/mailbox_pool_test.go` covers `NewMailboxPool`
+  validation, deterministic name → store routing, FNV distribution
+  sanity (no bucket gets >60% of 4k synthetic names), out-of-range
+  guard on `recordID`, round-robin spread for fileID reservation,
+  bounded FIFO eviction semantics, `isProbablyMailboxMiss` substring
+  classification (including the explicit negative cases for timeout,
+  401, 429, and plain network errors so a real failure is never
+  silently treated as "try the next mailbox"), and config validation
+  for the new `extra_mailboxes` field (limit, label safety, auth
+  presence). All existing tests still pass.
+
 ## v0.1.52 - 2026-05-19
 
 ### BREAKING

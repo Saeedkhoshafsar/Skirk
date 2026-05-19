@@ -89,6 +89,38 @@ type RouteConfig struct {
 type DriveConfig struct {
 	FolderID string `json:"folder_id,omitempty"`
 	Space    string `json:"space,omitempty"`
+	// ExtraMailboxes is an optional list of additional Google Drive mailboxes
+	// (each with its own OAuth credentials and target folder) that the tunnel
+	// can stripe traffic across. When set, the upload/download path uses a
+	// deterministic per-lane round-robin so both client and exit ends agree on
+	// which mailbox carries which lane, multiplying effective per-account
+	// Drive API quota by the total number of mailboxes.
+	//
+	// The "primary" mailbox is always the top-level Auth/DriveConfig pair.
+	// ExtraMailboxes appears in addition to it. A single-mailbox config (no
+	// ExtraMailboxes) behaves exactly like previous versions.
+	//
+	// Each entry must carry a valid OAuth refresh_token (or static
+	// access_token) and may set its own FolderID / Space. Lane assignment is
+	// strictly deterministic: lane i is served by mailbox i mod (len(Extra)+1)
+	// so the same lane is always uploaded to and polled from the same
+	// mailbox, with no cross-mailbox negotiation. This keeps backward
+	// compatibility: a client and exit with one extra mailbox will fail
+	// cleanly if the other side does not list the same number of mailboxes,
+	// because lane traffic simply won't appear in the unconfigured mailbox.
+	ExtraMailboxes []MailboxConfig `json:"extra_mailboxes,omitempty"`
+}
+
+// MailboxConfig describes an additional Drive mailbox used for multi-account
+// striping. The primary mailbox always uses the top-level Auth and
+// DriveConfig; ExtraMailboxes entries each carry their own.
+type MailboxConfig struct {
+	Auth     AuthConfig `json:"auth"`
+	FolderID string     `json:"folder_id,omitempty"`
+	Space    string     `json:"space,omitempty"`
+	// Label is an optional human-readable name used in observability logs.
+	// It must not contain secrets.
+	Label string `json:"label,omitempty"`
 }
 
 type TunnelConfig struct {
@@ -384,6 +416,28 @@ func (c *Config) Validate() error {
 		case "socks5", "socks5h", "http", "https":
 		default:
 			return fmt.Errorf("config.tunnel.exit_proxy scheme must be socks5, socks5h, http, or https")
+		}
+	}
+	// Reject obviously broken multi-mailbox configs early so an operator does
+	// not silently end up routing half their lanes into a mailbox that has no
+	// credentials. We deliberately keep this list short; deeper OAuth
+	// validation happens lazily when the AccessTokenSource first requests a
+	// token.
+	if len(c.Drive.ExtraMailboxes) > 0 {
+		if len(c.Drive.ExtraMailboxes) > 15 {
+			// 16 total mailboxes (1 primary + 15 extra) is well past the
+			// point where Drive prefix-list serialization dominates the
+			// hot path; refuse silently-bad operator setups.
+			return fmt.Errorf("config.drive.extra_mailboxes supports up to 15 entries (16 total mailboxes)")
+		}
+		for i, mb := range c.Drive.ExtraMailboxes {
+			if mb.Auth.RefreshToken == "" && mb.Auth.AccessToken == "" && mb.Auth.TokenCommand == "" {
+				return fmt.Errorf("config.drive.extra_mailboxes[%d] requires refresh_token, access_token, or token_command", i)
+			}
+			label := strings.TrimSpace(mb.Label)
+			if label != "" && !isSafeObjectSegment(label) {
+				return fmt.Errorf("config.drive.extra_mailboxes[%d].label may contain only letters, digits, underscore, hyphen, and dot", i)
+			}
 		}
 	}
 	return nil

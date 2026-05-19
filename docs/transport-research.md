@@ -57,6 +57,33 @@ A "way above" result is more likely to require changing a core constraint:
 
 Those are valid future product choices, but they are not muxv4-only tuning.
 
+### v0.1.53 update: multi-mailbox is now available (opt-in)
+
+The first item on the "way above" list — multiple independent Drive
+mailboxes — landed in v0.1.53 as `drive.extra_mailboxes` and the
+`MailboxPool` wrapper. The pool stripes traffic across mailboxes using
+deterministic FNV-1a routing on the object name, which lets both ends
+agree on which mailbox carries which lane without any negotiation, and
+keeps every mailbox's adaptive backoff independent so a 429 on one
+account does not stall the others. Single-mailbox configs are
+unaffected: the pool is only constructed when at least one extra
+mailbox is configured, and the per-mailbox HTTP transport tuning
+(MaxIdleConnsPerHost = 128, 64 KiB socket buffers, 1 MiB HTTP/2
+read-frame ceiling) is shared with the single-mailbox path so any
+existing deployment also benefits from the reduced syscall and
+handshake pressure.
+
+The pool is intentionally conservative on the rest of the surface:
+change-feed support is suppressed when more than one mailbox is active
+(the mux already falls back to merged FreshList* fan-outs in that
+case), pagination is collapsed into a single merged page, and fileID →
+mailbox mappings are kept in a bounded FIFO index so the resolution
+hot path stays O(1) without growing unbounded for long-running
+tunnels. Operators should treat the per-mailbox count as the
+quota-multiplier ceiling: N mailboxes give roughly N× the per-minute
+Drive API call budget under the same workload, but mux object size,
+visibility delay, and cleanup overhead per object are unchanged.
+
 ## Rejected Protocol Shapes
 
 Several protocol families were tested or primitive-tested and rejected because
