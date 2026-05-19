@@ -57,11 +57,15 @@ A "way above" result is more likely to require changing a core constraint:
 
 Those are valid future product choices, but they are not muxv4-only tuning.
 
-### v0.1.53 update: multi-mailbox is now available (opt-in)
+### v0.1.53/v0.1.54 update: multi-mailbox is now available (opt-in)
 
 The first item on the "way above" list — multiple independent Drive
 mailboxes — landed in v0.1.53 as `drive.extra_mailboxes` and the
-`MailboxPool` wrapper. The pool stripes traffic across mailboxes using
+`MailboxPool` wrapper. v0.1.54 wires the pool into the three runtime
+commands (`serve-client`, `serve-exit`, `bench-live`) via
+`BlobStoreWithPrimaryFromConfig` so the feature is reachable from the
+CLI without further code changes; admin paths (`revoke`, `cleanup`,
+`bench-drive`, the setup wizard) stay primary-only by design. The pool stripes traffic across mailboxes using
 deterministic FNV-1a routing on the object name, which lets both ends
 agree on which mailbox carries which lane without any negotiation, and
 keeps every mailbox's adaptive backoff independent so a 429 on one

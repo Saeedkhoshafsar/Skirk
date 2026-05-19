@@ -331,6 +331,37 @@ Skirk uses prefix-scoped fresh listing for runtime object discovery. The main
 latency knob exposed to clients is `--poll-ms`; lower values trade more Drive API
 calls for faster wakeups.
 
+### Multi-mailbox striping (opt-in)
+
+For deployments that hit Google Drive's per-account API quota under sustained
+load, you can spread traffic across multiple Google accounts. Add an
+`extra_mailboxes` list to the `drive` block of both the client and the exit
+config (the two sides must list the **same number** of mailboxes, in the same
+order, for lane routing to agree):
+
+```json
+{
+  "secret": "...",
+  "auth": { "refresh_token": "primary-token..." },
+  "drive": {
+    "folder_id": "primary-folder-id",
+    "extra_mailboxes": [
+      { "auth": { "refresh_token": "second-token..." }, "folder_id": "folder-2", "label": "alt1" },
+      { "auth": { "refresh_token": "third-token..." },  "folder_id": "folder-3", "label": "alt2" },
+      { "auth": { "refresh_token": "fourth-token..." }, "folder_id": "folder-4", "label": "alt3" }
+    ]
+  }
+}
+```
+
+Up to 15 extra mailboxes are accepted (16 total). With N mailboxes the
+effective per-minute Drive API budget multiplies by roughly N: each mailbox
+keeps an independent adaptive backoff, so a 429 on one mailbox does not stall
+the others. Lane assignment is deterministic (FNV-1a hash of the object name
+modulo pool size), so client and exit pick the same mailbox without
+negotiation. Omitting `extra_mailboxes` keeps the previous single-mailbox code
+path byte-for-byte.
+
 ## Documentation
 
 - [Install Guide](docs/install.md)
