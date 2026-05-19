@@ -18,7 +18,7 @@ consume each other's responses.
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

@@ -44,7 +44,7 @@ Drive replies are routed back to the correct device.
 Install Skirk on the exit machine:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 "$HOME/.local/bin/skirk" version
 ```
@@ -97,7 +97,7 @@ Uninstall from Linux:
 "$HOME/.local/bin/skirk" uninstall --dry-run
 "$HOME/.local/bin/skirk" uninstall --yes
 # or:
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh -s -- uninstall
 ```
 
 If you generated a kit with `--start-exit=false`, start the exit manually or
@@ -112,7 +112,7 @@ Copy the one-line text from `skirk-kit/client.skirk` and use it on a client.
 From a Linux client:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
 read -r SKIRK_CLIENT_CONFIG
@@ -238,7 +238,7 @@ environment-specific rather than guaranteed speed claims.
 The Linux installer can perform VPS setup non-interactively:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | \
   SKIRK_SERVER_SETUP=1 \
   sh
 ```
@@ -307,7 +307,7 @@ For a clean VPS install that should create the WARP wireproxy service, write the
 exit proxy into the generated config and start the exit service:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | \
   SKIRK_SERVER_SETUP=1 \
   SKIRK_INSTALL_SYSTEMD=1 \
   SKIRK_INSTALL_WIREPROXY=1 \

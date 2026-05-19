@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="${SKIRK_REPO:-ShahabSL/Skirk}"
+repo="${SKIRK_REPO:-Saeedkhoshafsar/Skirk}"
 version="${SKIRK_VERSION:-latest}"
 asset_base="${SKIRK_ASSET_BASE:-}"
 require_release_asset="${SKIRK_REQUIRE_RELEASE_ASSET:-}"
@@ -801,7 +801,9 @@ EOF
 main() {
   parse_args "$@"
   if [ "$dev_install" != "1" ]; then
-    repo="ShahabSL/Skirk"
+    # Lock to the canonical fork repo in non-dev installs to prevent
+    # hostile SKIRK_REPO / SKIRK_ASSET_BASE overrides during piped installs.
+    repo="Saeedkhoshafsar/Skirk"
     asset_base=""
   fi
   if [ -z "$require_release_asset" ]; then

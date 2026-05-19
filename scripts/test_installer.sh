@@ -71,7 +71,7 @@ if grep -Eq 'file://|bad/repo' "$tmp/curl-args"; then
   cat "$tmp/curl-args" >&2
   exit 1
 fi
-if ! grep -Fq 'github.com/ShahabSL/Skirk/releases/download/v9.9.9/skirk-linux-amd64.tar.gz' "$tmp/curl-args"; then
+if ! grep -Fq 'github.com/Saeedkhoshafsar/Skirk/releases/download/v9.9.9/skirk-linux-amd64.tar.gz' "$tmp/curl-args"; then
   echo "error: installer did not use canonical release URL in normal mode" >&2
   cat "$tmp/curl-args" >&2
   exit 1
