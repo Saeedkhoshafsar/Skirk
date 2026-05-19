@@ -30,6 +30,11 @@ const staleTokenMinimumLifetime = 2 * time.Minute
 const tokenRefreshRetryDelay = 1 * time.Minute
 
 type Config struct {
+	// Role identifies whether this config is for an "exit" node or a "client"
+	// node. When set, ApplyDefaults picks sensible per-role defaults (e.g.
+	// route.mode defaults to "direct" for exit, "real_pinned" for client).
+	// This field is optional; existing configs without it behave as before.
+	Role      string       `json:"role,omitempty"`
 	Secret    string       `json:"secret"`
 	SessionID string       `json:"session_id,omitempty"`
 	Client    ClientConfig `json:"client,omitempty"`
@@ -60,8 +65,10 @@ type OAuthAccessToken struct {
 }
 
 type AccessTokenSource struct {
-	auth  AuthConfig
-	route RouteConfig
+	auth   AuthConfig
+	route  RouteConfig
+	ctx    context.Context // cancelled by Close(); guards background goroutines
+	cancel context.CancelFunc
 
 	mu                 sync.Mutex
 	token              string
@@ -271,7 +278,13 @@ func isRawURLBase64Rune(r rune) bool {
 
 func (c *Config) ApplyDefaults() {
 	if c.Route.Mode == "" {
-		c.Route.Mode = "real_pinned"
+		// Exit nodes talk directly to the Drive API without fronting;
+		// clients use real_pinned by default for restricted-network traversal.
+		if strings.TrimSpace(c.Role) == "exit" {
+			c.Route.Mode = "direct"
+		} else {
+			c.Route.Mode = "real_pinned"
+		}
 	}
 	if c.Route.GoogleIP == "" {
 		c.Route.GoogleIP = "216.239.38.120"
@@ -395,8 +408,52 @@ func isSafeObjectSegment(value string) bool {
 	return true
 }
 
+// strictTokenCommand reports whether SKIRK_STRICT_TOKEN_COMMAND is set to a
+// truthy value. When true, tokenFromCommand refuses to invoke /bin/sh on a
+// command string that contains shell metacharacters instead of merely logging
+// a warning. The variable is read on every call so tests and one-off CLI
+// invocations can toggle it without restarting.
+func strictTokenCommand() bool {
+	v := strings.TrimSpace(os.Getenv("SKIRK_STRICT_TOKEN_COMMAND"))
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 func NewAccessTokenSource(auth AuthConfig, route RouteConfig) *AccessTokenSource {
-	return &AccessTokenSource{auth: auth, route: route}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &AccessTokenSource{auth: auth, route: route, ctx: ctx, cancel: cancel}
+}
+
+// Close cancels any in-flight background token refresh and scrubs the cached
+// access token from the in-memory source. It is safe to call multiple times.
+// The AccessTokenSource must not be used after Close returns.
+//
+// Scrubbing the token on Close limits the window during which a memory dump
+// (core file, /proc/$pid/mem snapshot, or a future Tauri/Android crash
+// reporter) could surface a still-valid OAuth bearer. Go strings are
+// immutable so this best-effort: we overwrite the *header* by replacing it
+// with the empty string. Any goroutine still holding a pre-Close copy is
+// unaffected, but the live AccessTokenSource no longer references the secret.
+func (s *AccessTokenSource) Close() {
+	if s == nil {
+		return
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.mu.Lock()
+	s.token = ""
+	s.expiresAt = time.Time{}
+	s.source = ""
+	s.refreshing = false
+	s.nextRefreshAttempt = time.Time{}
+	s.mu.Unlock()
 }
 
 func (s *AccessTokenSource) Token(ctx context.Context) (string, error) {
@@ -441,7 +498,13 @@ func (s *AccessTokenSource) Token(ctx context.Context) (string, error) {
 }
 
 func (s *AccessTokenSource) refreshInBackground() {
-	token, err := s.auth.accessTokenForRoute(context.Background(), s.route)
+	// Use s.ctx (cancellable via Close) so the background refresh aborts when
+	// the AccessTokenSource is shut down rather than leaking past tunnel exit.
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	token, err := s.auth.accessTokenForRoute(ctx, s.route)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refreshing = false
@@ -525,6 +588,24 @@ func (a AuthConfig) tokenFromCommand(ctx context.Context) (string, error) {
 	command := strings.TrimSpace(a.TokenCommand)
 	if command == "" {
 		return "", errors.New("no access token, refresh token, or token_command configured")
+	}
+	// token_command is run via /bin/sh, so any shell metacharacter in the
+	// configured string is a code-injection vector if the config arrived
+	// from an untrusted source (a shared profile, an MDM push, etc.). The
+	// default behaviour is to warn loudly so legitimate one-liners such as
+	// `gcloud auth print-access-token` keep working. Operators who want a
+	// hard refusal — for example because they load configs from shared
+	// links — can opt in by setting SKIRK_STRICT_TOKEN_COMMAND=1, in which
+	// case any metacharacter aborts the call before sh is exec'd.
+	if strings.ContainsAny(command, "`$(){};&|<>\n\r\\\"'") {
+		if strictTokenCommand() {
+			return "", fmt.Errorf(
+				"refusing to run token_command containing shell metacharacters " +
+					"because SKIRK_STRICT_TOKEN_COMMAND is set; quote-strip the " +
+					"value or unset the variable to allow the command to run",
+			)
+		}
+		log.Printf("WARNING: token_command contains shell metacharacters — ensure this value comes from a trusted source (set SKIRK_STRICT_TOKEN_COMMAND=1 to refuse instead of warn)")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -726,11 +807,11 @@ func tokenNeedsRefreshForRoute(now time.Time, expiresAt time.Time, route RouteCo
 		return false
 	}
 	margin := tokenRefreshMargin(route)
-	lifetime := expiresAt.Sub(now)
-	if lifetime < margin {
-		return true
-	}
-	return !now.Before(expiresAt.Add(-margin))
+	// lifetime <= margin covers both the strictly-expired case and the
+	// boundary case where lifetime == margin exactly. The previous
+	// implementation had a redundant second condition that was
+	// mathematically equivalent to this for all non-boundary cases.
+	return expiresAt.Sub(now) <= margin
 }
 
 func tokenRefreshMargin(route RouteConfig) time.Duration {

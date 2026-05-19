@@ -1617,7 +1617,7 @@ func TestMuxTerminalFailureClearsPendingWithoutRegisteredStream(t *testing.T) {
 		closed:           map[muxStreamKey]time.Time{},
 		pending:          map[muxStreamKey][]muxFrame{},
 		pendingBytes:     map[muxStreamKey]int{},
-		seen:             map[string]struct{}{},
+		seen:             map[string]seenEntry{},
 		queued:           map[string]struct{}{},
 		cleanupQueue:     make(chan cleanupTask, 1),
 		recvNormalReady:  make(chan muxStreamKey, 1),
@@ -2960,7 +2960,7 @@ func TestNormalMuxSchedulerDropsQueuedObjectsForClosedStream(t *testing.T) {
 		streams:          map[muxStreamKey]*muxStream{},
 		closed:           map[muxStreamKey]time.Time{},
 		pending:          map[muxStreamKey][]muxFrame{},
-		seen:             map[string]struct{}{},
+		seen:             map[string]seenEntry{},
 		queued:           map[string]struct{}{},
 		cleanupQueue:     make(chan cleanupTask, 1),
 		recvNormalReady:  make(chan muxStreamKey, 1),
@@ -3911,7 +3911,7 @@ func TestMuxPollContinuesWhenFreshListHasNextPageToken(t *testing.T) {
 		recvDir:   DirectionDown,
 		startedAt: startedAt,
 		listSince: startedAt,
-		seen:      map[string]struct{}{},
+		seen:      map[string]seenEntry{},
 		queued:    map[string]struct{}{},
 	}
 	if !mux.pollMuxObjects(context.Background()) {
@@ -4940,11 +4940,11 @@ func TestMuxClassFreshListDoesNotAdvanceSlidingCursorWhenTruncated(t *testing.T)
 
 func TestMuxMarkSeenCompactionPreservesQueuedClaims(t *testing.T) {
 	mux := &driveMux{
-		seen:   map[string]struct{}{},
+		seen:   map[string]seenEntry{},
 		queued: map[string]struct{}{"inflight": struct{}{}},
 	}
 	for i := 0; i <= 200000; i++ {
-		mux.seen[fmt.Sprintf("seen-%d", i)] = struct{}{}
+		mux.seen[fmt.Sprintf("seen-%d", i)] = seenEntry{}
 	}
 	mux.markSeen("done")
 	if !mux.isKnown("inflight") {
@@ -4952,6 +4952,153 @@ func TestMuxMarkSeenCompactionPreservesQueuedClaims(t *testing.T) {
 	}
 	if !mux.isKnown("done") {
 		t.Fatal("newly seen object was lost during seen compaction")
+	}
+}
+
+// muxMarkSeenWithSmallCap temporarily shrinks muxSeenSoftCap so we can drive
+// the three-stage TTL eviction without inserting 200k synthetic entries on
+// every test run.
+func muxMarkSeenWithSmallCap(t *testing.T, cap int) {
+	t.Helper()
+	prev := muxSeenSoftCap
+	muxSeenSoftCap = cap
+	t.Cleanup(func() { muxSeenSoftCap = prev })
+}
+
+// TestMuxMarkSeenFirstStageEvictsOldEntries verifies that the gentle 10-minute
+// cutoff is applied first: stale entries older than 10 minutes go away, while
+// entries newer than 10 minutes (including the 2-3 minute "warm" range) are
+// kept. This is the common path for steady-state high-traffic operation.
+func TestMuxMarkSeenFirstStageEvictsOldEntries(t *testing.T) {
+	muxMarkSeenWithSmallCap(t, 8)
+	now := time.Now()
+	mux := &driveMux{
+		seen:   map[string]seenEntry{},
+		queued: map[string]struct{}{},
+	}
+	// 6 "old" (>10min) entries that the first stage MUST evict.
+	for i := 0; i < 6; i++ {
+		mux.seen[fmt.Sprintf("old-%d", i)] = seenEntry{seenAt: now.Add(-15 * time.Minute)}
+	}
+	// 4 "warm" (3min, i.e. >2min but <10min) entries that the first stage
+	// MUST preserve. These would be killed by the second stage if it ran.
+	for i := 0; i < 4; i++ {
+		mux.seen[fmt.Sprintf("warm-%d", i)] = seenEntry{seenAt: now.Add(-3 * time.Minute)}
+	}
+	// markSeen will add one fresh entry, pushing len(seen) to 11 (>8 cap),
+	// triggering compaction.
+	mux.markSeen("fresh")
+
+	if !mux.isKnown("fresh") {
+		t.Fatal("newly inserted entry must survive compaction")
+	}
+	for i := 0; i < 4; i++ {
+		if !mux.isKnown(fmt.Sprintf("warm-%d", i)) {
+			t.Fatalf("stage 1 (10min TTL) wrongly evicted warm-%d (~3 min old)", i)
+		}
+	}
+	for i := 0; i < 6; i++ {
+		if mux.isKnown(fmt.Sprintf("old-%d", i)) {
+			t.Fatalf("stage 1 (10min TTL) failed to evict old-%d (~15 min old)", i)
+		}
+	}
+}
+
+// TestMuxMarkSeenSecondStageRunsOnlyWhenFirstInsufficient verifies that the
+// aggressive 2-minute cutoff is applied only when the gentle 10-minute pass
+// leaves the map still over the soft cap. This protects dedup state in
+// normal conditions while still bounding memory in a sustained burst.
+func TestMuxMarkSeenSecondStageRunsOnlyWhenFirstInsufficient(t *testing.T) {
+	muxMarkSeenWithSmallCap(t, 8)
+	now := time.Now()
+	mux := &driveMux{
+		seen:   map[string]seenEntry{},
+		queued: map[string]struct{}{},
+	}
+	// All 12 entries are <10min old, so stage 1 evicts nothing.
+	// 6 are in the 2-10 min band (stage 2 must evict).
+	for i := 0; i < 6; i++ {
+		mux.seen[fmt.Sprintf("warm-%d", i)] = seenEntry{seenAt: now.Add(-5 * time.Minute)}
+	}
+	// 6 are <2min old (stage 2 must preserve).
+	for i := 0; i < 6; i++ {
+		mux.seen[fmt.Sprintf("hot-%d", i)] = seenEntry{seenAt: now.Add(-30 * time.Second)}
+	}
+	mux.markSeen("fresh") // 13 entries -> over cap of 8
+
+	if !mux.isKnown("fresh") {
+		t.Fatal("newly inserted entry must survive compaction")
+	}
+	for i := 0; i < 6; i++ {
+		if !mux.isKnown(fmt.Sprintf("hot-%d", i)) {
+			t.Fatalf("stage 2 (2min TTL) wrongly evicted hot-%d (~30s old)", i)
+		}
+	}
+	for i := 0; i < 6; i++ {
+		if mux.isKnown(fmt.Sprintf("warm-%d", i)) {
+			t.Fatalf("stage 2 (2min TTL) failed to evict warm-%d (~5 min old)", i)
+		}
+	}
+}
+
+// TestMuxMarkSeenLastResortResetsWhenAllRecent verifies that when even the
+// 2-minute pass cannot bring the map below the soft cap (a true burst where
+// thousands of objects landed in the last 2 minutes), markSeen falls back to
+// the catastrophic reset and keeps the freshly inserted name. This is the
+// final OOM guard from the original implementation, retained intentionally.
+func TestMuxMarkSeenLastResortResetsWhenAllRecent(t *testing.T) {
+	muxMarkSeenWithSmallCap(t, 8)
+	now := time.Now()
+	mux := &driveMux{
+		seen:   map[string]seenEntry{},
+		queued: map[string]struct{}{"inflight": struct{}{}},
+	}
+	// All entries are <2min old, so stage 1 and stage 2 both no-op.
+	for i := 0; i < 12; i++ {
+		mux.seen[fmt.Sprintf("burst-%d", i)] = seenEntry{seenAt: now.Add(-10 * time.Second)}
+	}
+	mux.markSeen("fresh")
+
+	// Last-resort reset: seen map should contain ONLY the freshly inserted
+	// entry; queued claims survive because they live in a separate map.
+	if got := len(mux.seen); got != 1 {
+		t.Fatalf("last-resort reset should leave exactly 1 entry, got %d", got)
+	}
+	if !mux.isKnown("fresh") {
+		t.Fatal("freshly inserted entry must survive last-resort reset")
+	}
+	if !mux.isKnown("inflight") {
+		t.Fatal("queued in-flight claim must survive last-resort reset")
+	}
+	for i := 0; i < 12; i++ {
+		if mux.isKnown(fmt.Sprintf("burst-%d", i)) {
+			t.Fatalf("last-resort reset failed to clear burst-%d", i)
+		}
+	}
+}
+
+// TestMuxMarkSeenNoCompactionBelowCap verifies the fast path: when len(seen)
+// is at or below the cap, markSeen must not touch any other entries.
+func TestMuxMarkSeenNoCompactionBelowCap(t *testing.T) {
+	muxMarkSeenWithSmallCap(t, 8)
+	now := time.Now()
+	mux := &driveMux{
+		seen:   map[string]seenEntry{},
+		queued: map[string]struct{}{},
+	}
+	// Even ancient entries must be preserved when we are not over the cap.
+	for i := 0; i < 4; i++ {
+		mux.seen[fmt.Sprintf("ancient-%d", i)] = seenEntry{seenAt: now.Add(-1 * time.Hour)}
+	}
+	mux.markSeen("fresh") // 5 entries, well under cap of 8
+
+	for i := 0; i < 4; i++ {
+		if !mux.isKnown(fmt.Sprintf("ancient-%d", i)) {
+			t.Fatalf("ancient-%d wrongly evicted while under soft cap", i)
+		}
+	}
+	if !mux.isKnown("fresh") {
+		t.Fatal("freshly inserted entry missing")
 	}
 }
 
@@ -5055,7 +5202,7 @@ func TestMuxProcessFailureBackoffDoesNotImmediateRequeue(t *testing.T) {
 	ctx := context.Background()
 	mux := &driveMux{
 		t:                &Tunnel{},
-		seen:             map[string]struct{}{},
+		seen:             map[string]seenEntry{},
 		queued:           map[string]struct{}{},
 		recvUrgent:       make(chan muxObjectMeta, 1),
 		recvNormalReady:  make(chan muxStreamKey, 1),
@@ -5203,7 +5350,7 @@ func TestMuxProcessRetryBudgetTerminalFailureDoesNotRequeue(t *testing.T) {
 	ctx := context.Background()
 	mux := &driveMux{
 		t:                &Tunnel{CleanupProcessed: true},
-		seen:             map[string]struct{}{},
+		seen:             map[string]seenEntry{},
 		queued:           map[string]struct{}{},
 		closed:           map[muxStreamKey]time.Time{},
 		cleanupQueue:     make(chan cleanupTask, 1),
@@ -5259,7 +5406,7 @@ func TestMuxProcessDriveNotFoundDropsStaleObjectWithoutRequeue(t *testing.T) {
 	}
 	mux := &driveMux{
 		t:                tunnel,
-		seen:             map[string]struct{}{},
+		seen:             map[string]seenEntry{},
 		queued:           map[string]struct{}{},
 		closed:           map[muxStreamKey]time.Time{},
 		cleanupQueue:     make(chan cleanupTask, 1),
@@ -5396,7 +5543,7 @@ func TestMuxProcessTerminalFailureClosesAllMixedStreams(t *testing.T) {
 	ctx := context.Background()
 	mux := &driveMux{
 		t:            &Tunnel{CleanupProcessed: true},
-		seen:         map[string]struct{}{},
+		seen:         map[string]seenEntry{},
 		queued:       map[string]struct{}{},
 		closed:       map[muxStreamKey]time.Time{},
 		cleanupQueue: make(chan cleanupTask, 1),

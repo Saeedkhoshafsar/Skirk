@@ -224,6 +224,9 @@ func cleanup(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Cleanup is a one-shot command; release the OAuth refresh goroutine
+	// before returning so the process can exit cleanly.
+	defer drive.Close()
 	if *all {
 		if strings.TrimSpace(*prefix) != "" {
 			return fmt.Errorf("--all cannot be combined with --prefix")
@@ -350,6 +353,10 @@ func serveClient(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// serveClient owns the DriveStore for the lifetime of the SOCKS server;
+	// close it on every exit path so the background OAuth refresh goroutine
+	// shuts down and the process can terminate without leaks.
+	defer drive.Close()
 	tunnel, err := skirk.NewTunnel(drive, cfg)
 	if err != nil {
 		return err
@@ -384,6 +391,9 @@ func serveExit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// serveExit holds the DriveStore for the entire polling lifetime;
+	// release the background OAuth refresh goroutine on shutdown.
+	defer drive.Close()
 	if strings.TrimSpace(*exitProxy) != "" {
 		cfg.Tunnel.ExitProxy = strings.TrimSpace(*exitProxy)
 	}
@@ -714,6 +724,8 @@ func benchLive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Bench is a one-shot command; release the OAuth refresh goroutine on exit.
+	defer drive.Close()
 	tunnel, err := skirk.NewTunnel(drive, cfg)
 	if err != nil {
 		return err
@@ -833,6 +845,8 @@ func benchDrive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// bench-drive is a one-shot command; release the OAuth refresh goroutine on exit.
+	defer drive.Close()
 	drive.ResetTelemetry()
 	started := time.Now()
 	prefix := fmt.Sprintf("bench-drive/%s/", started.UTC().Format("20060102T150405.000000000Z"))

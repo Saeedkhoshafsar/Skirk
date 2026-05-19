@@ -94,6 +94,29 @@ type Tunnel struct {
 	Logger               *log.Logger
 }
 
+// muxLimitsLogOnce ensures we only emit the mux-limits banner once per
+// process even if multiple Tunnels are constructed.
+var muxLimitsLogOnce sync.Once
+
+func logMuxLimitsOnce(logger *log.Logger) {
+	muxLimitsLogOnce.Do(func() {
+		if logger == nil {
+			logger = log.Default()
+		}
+		logger.Printf(
+			"mux limits profile=%s lane=%d MiB stream=%d MiB recv_queue=%d MiB recv_global=%d MiB pending_stream=%d MiB pending_global=%d MiB pause=%d MiB",
+			muxLimitsProfile,
+			muxNormalLaneQueueBytes>>20,
+			muxNormalStreamQueueBytes>>20,
+			muxNormalReceiveQueueBytes>>20,
+			muxNormalReceiveGlobalBytes>>20,
+			muxPendingStreamBytes>>20,
+			muxPendingGlobalBytes>>20,
+			muxStreamPauseBytes>>20,
+		)
+	})
+}
+
 func NewTunnel(data BlobStore, cfg *Config) (*Tunnel, error) {
 	sid, err := ParseSessionID(cfg.SessionID)
 	if err != nil {
@@ -122,7 +145,15 @@ func NewTunnel(data BlobStore, cfg *Config) (*Tunnel, error) {
 		CleanupProcessed:    cfg.Tunnel.CleanupProcessed,
 		Logger:              log.Default(),
 	}
+	// Propagate the declared role from config so that worker-count and
+	// limiter-window calculations have the correct role from the very first
+	// Acquire call, even before serveMuxClient/serveMuxExit set it again.
+	switch strings.TrimSpace(cfg.Role) {
+	case "client", "exit":
+		t.role = strings.TrimSpace(cfg.Role)
+	}
 	t.markActivity()
+	logMuxLimitsOnce(t.Logger)
 	return t, nil
 }
 
@@ -277,7 +308,11 @@ func (t *Tunnel) dialExitTarget(ctx context.Context, target string) (net.Conn, e
 }
 
 func dialDirectExitTarget(ctx context.Context, target, family string) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: exitDialTimeout, KeepAlive: 30 * time.Second}
+	// Timeout is omitted here: dialExitTarget already wraps ctx with
+	// context.WithTimeout(exitDialTimeout), so the context deadline is the
+	// authoritative deadline. A duplicate Dialer.Timeout set to the same
+	// value would be redundant and misleading.
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
 	primary, fallback := exitDialNetworks(target, family)
 	if primary != "" {
 		attemptCtx, cancel := context.WithTimeout(ctx, exitFamilyPreferenceTimeout)
