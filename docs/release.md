@@ -76,7 +76,7 @@ The workflow publishes SHA-256 checksums and GitHub artifact attestations for
 the APK and archives. Verify a downloaded asset with:
 
 ```bash
-gh attestation verify ./skirk-android-arm64.apk -R ShahabSL/Skirk
+gh attestation verify ./skirk-android-arm64.apk -R Saeedkhoshafsar/Skirk
 sha256sum -c SHA256SUMS
 ```
 
@@ -92,19 +92,19 @@ git push origin vX.Y.Z
 After the release exists, Linux users can install with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 ```
 
 Or pin the version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
 ```
 
 Equivalent pinned install using an argument:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh -s -- --version vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh -s -- --version vX.Y.Z
 ```
 
 ## Android Signing
@@ -125,7 +125,7 @@ Current Android release signing certificate SHA-256:
 Before tagging, validate the public setup flow from a clean Linux machine:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
 export PATH="$HOME/.local/bin:$PATH"
 skirk version
 skirk setup init --out skirk-kit --reset-google-login
@@ -136,7 +136,7 @@ Also validate that pinned release updates cannot be redirected by inherited
 installer environment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | \
   SKIRK_REPO=bad/repo SKIRK_ASSET_BASE=file:///tmp/bad SKIRK_VERSION=vX.Y.Z sh
 skirk version
 ```

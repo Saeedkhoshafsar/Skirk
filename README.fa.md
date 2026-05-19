@@ -37,7 +37,7 @@ Google Drive، Cloudflare، GitHub، Microsoft، Android یا هیچ ارائه�
 روی دستگاه خروجی Skirk را نصب کنید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -62,7 +62,7 @@ skirk serve-exit --config skirk-kit/exit.json
 روی کلاینت Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
 read -r SKIRK_CLIENT_CONFIG

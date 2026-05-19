@@ -14,7 +14,7 @@ port because both sides exchange encrypted objects through Google Drive.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 "$HOME/.local/bin/skirk" version
 ```

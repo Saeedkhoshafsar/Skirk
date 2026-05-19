@@ -296,7 +296,7 @@ builds when the required SDK environment is present.
 8. Watch the `Release` GitHub Actions workflow.
 9. Verify release assets with `gh release view vX.Y.Z`.
 10. Verify artifact attestations for at least one downloaded asset with
-    `gh attestation verify <asset> -R ShahabSL/Skirk`.
+    `gh attestation verify <asset> -R Saeedkhoshafsar/Skirk`.
 
 The release workflow publishes:
 

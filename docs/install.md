@@ -5,7 +5,7 @@
 Use this on a Linux exit machine, Linux client, VPS, laptop, or home server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 "$HOME/.local/bin/skirk" version
 ```
@@ -28,19 +28,19 @@ approval. Pass `--start-exit=false` when you only want to generate configs.
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | SKIRK_VERSION=vX.Y.Z sh
 ```
 
 Equivalent pinned install using an argument:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh -s -- --version vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh -s -- --version vX.Y.Z
 ```
 
 Install to another directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | SKIRK_INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | SKIRK_INSTALL_DIR=/usr/local/bin sh
 ```
 
 Development-only installs from a fork or local asset mirror require the explicit
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/OWNER/Skirk/main/install.sh | \
 Review before running:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh
 less install.sh
 sh install.sh
 ```
@@ -202,7 +202,7 @@ From the installed binary:
 From the installer script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | sh -s -- uninstall
 ```
 
 Default uninstall behavior is intentionally conservative: it removes the
@@ -224,7 +224,7 @@ Common complete cleanup:
 If you installed Skirk to a custom directory or used a custom service name:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | \
   SKIRK_INSTALL_DIR=/usr/local/bin \
   SKIRK_SERVICE_NAME=my-skirk-exit \
   sh -s -- uninstall
@@ -233,7 +233,7 @@ curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
 To also install Cloudflare WARP through wireproxy and point exit traffic at it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/main/install.sh | \
   SKIRK_SERVER_SETUP=1 \
   SKIRK_INSTALL_SYSTEMD=1 \
   SKIRK_INSTALL_WIREPROXY=1 \

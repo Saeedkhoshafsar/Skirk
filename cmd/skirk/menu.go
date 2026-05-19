@@ -531,7 +531,7 @@ func installerScriptURL() string {
 	if safeInstallerRef(version) {
 		ref = version
 	}
-	return "https://raw.githubusercontent.com/ShahabSL/Skirk/" + ref + "/install.sh"
+	return "https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/" + ref + "/install.sh"
 }
 
 func safeInstallerRef(value string) bool {
@@ -603,7 +603,7 @@ case "$1" in
   v*) ref="$1" ;;
   *) echo "error: update version must be latest or a vX.Y.Z tag" >&2; exit 1 ;;
 esac
-curl -fsSL "https://raw.githubusercontent.com/ShahabSL/Skirk/$ref/install.sh" -o "$tmp"
+curl -fsSL "https://raw.githubusercontent.com/Saeedkhoshafsar/Skirk/$ref/install.sh" -o "$tmp"
 sh "$tmp" --version "$1"`
 	cmd := exec.CommandContext(ctx, "sh", "-c", script, "skirk-update", versionValue)
 	cmd.Stdout = os.Stdout
