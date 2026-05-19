@@ -124,10 +124,10 @@ func TestMailboxPoolRecordIDIgnoresOutOfRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMailboxPool: %v", err)
 	}
-	pool.recordID("", 0)             // empty id silently ignored
-	pool.recordID("x", -1)           // negative index silently ignored
-	pool.recordID("y", 99)           // out-of-range index silently ignored
-	pool.recordID("z", pool.Size())  // size itself is out of range
+	pool.recordID("", 0)            // empty id silently ignored
+	pool.recordID("x", -1)          // negative index silently ignored
+	pool.recordID("y", 99)          // out-of-range index silently ignored
+	pool.recordID("z", pool.Size()) // size itself is out of range
 	for _, k := range []string{"", "x", "y", "z"} {
 		if _, ok := pool.idIndex.get(k); ok {
 			t.Errorf("recordID accepted invalid input for key %q", k)

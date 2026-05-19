@@ -141,7 +141,7 @@ func NewGoogleHTTPClient(route RouteConfig) *GoogleHTTPClient {
 		return uconn, nil
 	}
 	transport := &http.Transport{
-		DialContext: dialContext,
+		DialContext:       dialContext,
 		ForceAttemptHTTP2: !isGoogleFrontHTTP1Route(route.Mode),
 		// Increased from 256/64 to 512/128 in v0.1.53 so a multi-mailbox
 		// pool (each mailbox warms its own session against the same Google
