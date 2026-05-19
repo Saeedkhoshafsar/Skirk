@@ -39,12 +39,31 @@ func StoresFromConfig(ctx context.Context, cfg *Config) (*DriveStore, error) {
 // path) so a misconfigured extra mailbox fails fast at startup rather
 // than silently dropping every Nth lane's traffic later.
 func BlobStoreFromConfig(ctx context.Context, cfg *Config) (BlobStore, func(), error) {
+	store, _, closer, err := BlobStoreWithPrimaryFromConfig(ctx, cfg)
+	return store, closer, err
+}
+
+// BlobStoreWithPrimaryFromConfig is the canonical multi-mailbox factory:
+// it always returns the primary DriveStore alongside the BlobStore that
+// callers should feed into NewTunnel. When ExtraMailboxes is empty, the
+// returned BlobStore IS the primary DriveStore (single allocation); when
+// ExtraMailboxes is set, the BlobStore is a MailboxPool whose mailbox 0
+// is that same primary.
+//
+// Exposing the primary lets callers run admin-only operations
+// (DriveCleanup, QuotaSnapshot, ResetTelemetry) that the BlobStore
+// interface intentionally does not surface, without forking two separate
+// token sources for the same primary mailbox.
+//
+// The closer cleans up every underlying token source (primary + extras)
+// in a single call; callers should defer it on every exit path.
+func BlobStoreWithPrimaryFromConfig(ctx context.Context, cfg *Config) (BlobStore, *DriveStore, func(), error) {
 	primary, err := StoresFromConfig(ctx, cfg)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 	if len(cfg.Drive.ExtraMailboxes) == 0 {
-		return primary, primary.Close, nil
+		return primary, primary, primary.Close, nil
 	}
 	extras := make([]*DriveStore, 0, len(cfg.Drive.ExtraMailboxes))
 	cleanup := func() {
@@ -61,7 +80,7 @@ func BlobStoreFromConfig(ctx context.Context, cfg *Config) (BlobStore, func(), e
 		if _, err := ts.Token(ctx); err != nil {
 			ts.Close()
 			cleanup()
-			return nil, func() {}, fmt.Errorf("extra mailbox[%d] token init failed: %w", i, err)
+			return nil, nil, func() {}, fmt.Errorf("extra mailbox[%d] token init failed: %w", i, err)
 		}
 		// Reuse the primary HTTP client per mailbox; it is route-scoped, not
 		// auth-scoped, and reusing it preserves the warmed connection pool
@@ -77,9 +96,9 @@ func BlobStoreFromConfig(ctx context.Context, cfg *Config) (BlobStore, func(), e
 	pool, err := NewMailboxPool(primary, extras...)
 	if err != nil {
 		cleanup()
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
 	pool.SetLogger(log.Default())
 	log.Default().Printf("mailbox pool active mailboxes=%d primary_folder=%s extras=%d", pool.Size(), cfg.Drive.FolderID, len(extras))
-	return pool, cleanup, nil
+	return pool, primary, cleanup, nil
 }

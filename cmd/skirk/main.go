@@ -349,20 +349,22 @@ func serveClient(ctx context.Context, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	drive, err := skirk.StoresFromConfig(ctx, cfg)
+	// serveClient owns the BlobStore for the lifetime of the SOCKS server.
+	// When extra_mailboxes is configured, BlobStoreFromConfig returns a
+	// MailboxPool that stripes traffic deterministically across mailboxes;
+	// otherwise it returns the single primary DriveStore unchanged.
+	// The closer drops every underlying OAuth refresh goroutine on shutdown.
+	data, closeStores, err := skirk.BlobStoreFromConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	// serveClient owns the DriveStore for the lifetime of the SOCKS server;
-	// close it on every exit path so the background OAuth refresh goroutine
-	// shuts down and the process can terminate without leaks.
-	defer drive.Close()
-	tunnel, err := skirk.NewTunnel(drive, cfg)
+	defer closeStores()
+	tunnel, err := skirk.NewTunnel(data, cfg)
 	if err != nil {
 		return err
 	}
 	addr := firstNonEmpty(*listen, cfg.Tunnel.Listen)
-	log.Printf("skirk client SOCKS5 listening on %s session=%s client=%s run=%s route=%s transport=%s upstream=%s", addr, skirk.SessionString(tunnel.SessionID), cfg.Client.ID, cfg.Client.RunID, cfg.Route.Mode, cfg.Tunnel.Transport, firstNonEmpty(cfg.Route.Proxy, "none"))
+	log.Printf("skirk client SOCKS5 listening on %s session=%s client=%s run=%s route=%s transport=%s upstream=%s mailboxes=%d", addr, skirk.SessionString(tunnel.SessionID), cfg.Client.ID, cfg.Client.RunID, cfg.Route.Mode, cfg.Tunnel.Transport, firstNonEmpty(cfg.Route.Proxy, "none"), 1+len(cfg.Drive.ExtraMailboxes))
 	errCh := make(chan error, 2)
 	go func() { errCh <- tunnel.ServeClient(ctx, addr) }()
 	if strings.TrimSpace(*httpProxyListen) != "" {
@@ -387,13 +389,19 @@ func serveExit(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, drive, err := load(*configPath)
+	cfg, err := skirk.LoadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	// serveExit holds the DriveStore for the entire polling lifetime;
-	// release the background OAuth refresh goroutine on shutdown.
-	defer drive.Close()
+	// serveExit holds the BlobStore (single DriveStore or MailboxPool) for
+	// the entire polling lifetime. We also keep the primary *DriveStore on
+	// hand for janitor sweeps and admin operations that aren't part of the
+	// BlobStore interface.
+	data, primary, closeStores, err := skirk.BlobStoreWithPrimaryFromConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer closeStores()
 	if strings.TrimSpace(*exitProxy) != "" {
 		cfg.Tunnel.ExitProxy = strings.TrimSpace(*exitProxy)
 	}
@@ -409,7 +417,7 @@ func serveExit(ctx context.Context, args []string) error {
 	if err := applyTunnelOverrides(cfg, *chunkSize, *pollMS, *concurrency, *uploadConcurrency, *downloadConcurrency); err != nil {
 		return err
 	}
-	tunnel, err := skirk.NewTunnel(drive, cfg)
+	tunnel, err := skirk.NewTunnel(data, cfg)
 	if err != nil {
 		return err
 	}
@@ -418,8 +426,8 @@ func serveExit(ctx context.Context, args []string) error {
 		return err
 	}
 	defer lock.Close()
-	startMailboxJanitor(ctx, drive)
-	log.Printf("skirk exit polling session=%s transport=%s exit_proxy=%s exit_ip_family=%s", skirk.SessionString(tunnel.SessionID), cfg.Tunnel.Transport, firstNonEmpty(tunnel.ExitProxy, "none"), firstNonEmpty(tunnel.ExitIPFamily, "prefer_ipv4"))
+	startMailboxJanitor(ctx, primary)
+	log.Printf("skirk exit polling session=%s transport=%s exit_proxy=%s exit_ip_family=%s mailboxes=%d", skirk.SessionString(tunnel.SessionID), cfg.Tunnel.Transport, firstNonEmpty(tunnel.ExitProxy, "none"), firstNonEmpty(tunnel.ExitIPFamily, "prefer_ipv4"), 1+len(cfg.Drive.ExtraMailboxes))
 	return tunnel.ServeExit(ctx)
 }
 
@@ -720,13 +728,16 @@ func benchLive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	drive, err := skirk.StoresFromConfig(ctx, cfg)
+	// bench-live exercises the full tunnel, so honour multi-mailbox
+	// striping here too. Quota telemetry is reported from the primary
+	// mailbox only; extras report their own counters via the pool log.
+	data, primary, closeStores, err := skirk.BlobStoreWithPrimaryFromConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	// Bench is a one-shot command; release the OAuth refresh goroutine on exit.
-	defer drive.Close()
-	tunnel, err := skirk.NewTunnel(drive, cfg)
+	// Bench is a one-shot command; release every OAuth refresh goroutine on exit.
+	defer closeStores()
+	tunnel, err := skirk.NewTunnel(data, cfg)
 	if err != nil {
 		return err
 	}
@@ -737,7 +748,7 @@ func benchLive(ctx context.Context, args []string) error {
 	if err := waitForTCP(ctx, addr, errCh); err != nil {
 		return err
 	}
-	drive.ResetTelemetry()
+	primary.ResetTelemetry()
 	started := time.Now()
 	smallSamples, err := runHTTPSamples(ctx, addr, strings.TrimSpace(*smallURL), *samples, *smallParallel, *timeout, *stallTime, *speedLimit, *speedTime)
 	if err != nil {
@@ -755,7 +766,7 @@ func benchLive(ctx context.Context, args []string) error {
 		bulkHTTPResults = bulkSamples
 	}
 	duration := time.Since(started)
-	quota := drive.QuotaSnapshot()
+	quota := primary.QuotaSnapshot()
 	totalRequests := len(smallSamples)
 	if bulkSummary != nil {
 		totalRequests += len(bulkHTTPResults)

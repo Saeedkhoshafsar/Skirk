@@ -218,6 +218,35 @@ skirk serve-client \
 `100` میلی‌ثانیه است؛ polling تهاجمی‌تر می‌تواند رقابت بیشتری روی Drive ایجاد
 کند.
 
+### Multi-mailbox (چند اکانت Google Drive به‌صورت موازی)
+
+اگر بار کاری شما به سقف کوتای API گوگل برای یک اکانت می‌خورد، می‌توانید چند
+اکانت گوگل را به‌صورت موازی استفاده کنید. کافی است در کانفیگ کلاینت و exit
+(هر دو طرف باید **تعداد و ترتیب** یکسانی از mailbox داشته باشند) لیست
+`extra_mailboxes` را به بلاک `drive` اضافه کنید:
+
+```json
+{
+  "secret": "...",
+  "auth": { "refresh_token": "primary-token..." },
+  "drive": {
+    "folder_id": "primary-folder-id",
+    "extra_mailboxes": [
+      { "auth": { "refresh_token": "second-token..." }, "folder_id": "folder-2", "label": "alt1" },
+      { "auth": { "refresh_token": "third-token..." },  "folder_id": "folder-3", "label": "alt2" },
+      { "auth": { "refresh_token": "fourth-token..." }, "folder_id": "folder-4", "label": "alt3" }
+    ]
+  }
+}
+```
+
+تا ۱۵ mailbox اضافی پشتیبانی می‌شود (مجموع ۱۶ تا). با N اکانت، کوتای API
+گوگل تقریباً N برابر می‌شود: هر mailbox backoff تطبیقی مستقل خود را دارد،
+بنابراین خوردن 429 روی یک اکانت بقیه را stall نمی‌کند. تخصیص lane کاملاً
+deterministic است (هش FNV-1a روی نام object به‌علاوه‌ی pool size) تا کلاینت و
+exit بدون مذاکره به یک mailbox برسند. حذف `extra_mailboxes` رفتار را
+byte-for-byte به حالت تک‌mailbox قبلی برمی‌گرداند.
+
 ## مستندات
 
 - [راهنمای نصب](docs/install.md)

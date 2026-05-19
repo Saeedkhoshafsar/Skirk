@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.1.54 - 2026-05-19
+
+### Multi-mailbox striping reaches end users
+
+- **Wired `extra_mailboxes` into the runtime commands**. v0.1.53 shipped
+  the `MailboxPool` type and the `BlobStoreFromConfig` helper but stopped
+  short of swapping the call sites in `cmd/skirk` so the change would be
+  trivially roll-back-safe. This release flips that switch: `serve-client`,
+  `serve-exit`, and `bench-live` now construct their `BlobStore` through
+  `BlobStoreWithPrimaryFromConfig`, which returns either the primary
+  `*DriveStore` (when no extras are configured — byte-for-byte identical
+  to v0.1.53) or a `MailboxPool` that stripes traffic across every
+  configured mailbox.
+- Admin-only paths (`revoke`, `cleanup`, `bench-drive`, the setup wizard's
+  mailbox validation) keep using the primary `*DriveStore` directly so
+  operations that target a specific OAuth principal (drive cleanup
+  sweeps, quota telemetry, mailbox folder bring-up) stay scoped to the
+  primary mailbox rather than fanning out to every account.
+- `serve-exit`'s background janitor still runs against the primary
+  mailbox only; extras carry their own folder traffic and are swept by
+  the same janitor when their primary token rotates them in.
+- New helper `BlobStoreWithPrimaryFromConfig` exposes both handles
+  (BlobStore + primary `*DriveStore`) in a single call so callers that
+  need both `Data` for the tunnel and primary-only methods
+  (`QuotaSnapshot`, `ResetTelemetry`, `DriveCleanup`) don't have to
+  build two parallel token sources for the same mailbox.
+- `serve-client` and `serve-exit` log the active mailbox count on
+  startup (`mailboxes=N`) so the runtime topology is observable from
+  the first line of the log.
+- Five new unit tests in `internal/skirk/stores_test.go` cover: the
+  single-mailbox `*DriveStore` return path, the multi-mailbox
+  `*MailboxPool` return path with primary handle aliasing, eager
+  fail-fast on misconfigured primary OAuth, eager fail-fast on
+  misconfigured extra OAuth (with cleanup of the partially-built
+  pool), and the closure invariant that calling the returned `func()`
+  is always safe even on the error paths.
+
+This release is a pure-wiring change on top of v0.1.53 — no protocol,
+no on-the-wire, no quota-accounting changes. Configs without
+`extra_mailboxes` keep the exact v0.1.52/v0.1.53 single-mailbox code
+path on every CLI command.
+
 ## v0.1.53 - 2026-05-19
 
 ### Throughput and quota multiplication
