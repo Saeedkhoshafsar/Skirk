@@ -76,3 +76,27 @@ func TestDeriveMuxLaneKeyV4SeparatesClientsRunsAndDirections(t *testing.T) {
 		t.Fatal("mux v4 keys must differ by client id, run id, and direction")
 	}
 }
+
+// TestNonceUniquenessAcrossDirectionAndSequence verifies that the nonce
+// derivation produces distinct values for different directions and sequence
+// numbers under a fixed session ID, which is the property AES-GCM needs to
+// stay safe against nonce reuse within a single session/key pair.
+func TestNonceUniquenessAcrossDirectionAndSequence(t *testing.T) {
+	var sid [16]byte
+	for i := range sid {
+		sid[i] = byte(i + 1)
+	}
+	nUp := nonce(sid, DirectionUp, 1)
+	nDown := nonce(sid, DirectionDown, 1)
+	if bytes.Equal(nUp, nDown) {
+		t.Fatal("nonce must differ between DirectionUp and DirectionDown")
+	}
+	nSeq1 := nonce(sid, DirectionUp, 1)
+	nSeq2 := nonce(sid, DirectionUp, 2)
+	if bytes.Equal(nSeq1, nSeq2) {
+		t.Fatal("nonce must differ between sequence 1 and 2")
+	}
+	if len(nUp) != 12 {
+		t.Fatalf("nonce length must be 12 bytes (AES-GCM), got %d", len(nUp))
+	}
+}

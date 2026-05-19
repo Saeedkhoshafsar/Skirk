@@ -321,7 +321,10 @@ func (c *GoogleHTTPClient) requestOnce(ctx context.Context, method, host, path s
 		bodyReader = gzipReader
 		resp.Header.Del("Content-Encoding")
 	}
-	responseBody, err := io.ReadAll(bodyReader)
+	// Cap response bodies at 32 MiB to prevent a malicious or buggy Drive
+	// endpoint from forcing unbounded allocations. Legitimate Drive API
+	// responses for our use cases (metadata + small JSON) are far below this.
+	responseBody, err := io.ReadAll(io.LimitReader(bodyReader, 32<<20))
 	if err != nil {
 		return nil, err
 	}

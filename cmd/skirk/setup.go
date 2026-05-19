@@ -478,6 +478,9 @@ func createVisibleDriveMailbox(ctx context.Context, auth skirk.AuthConfig, googl
 	if err != nil {
 		return skirk.DriveConfig{}, "", err
 	}
+	// Setup uses a transient DriveStore; release its background OAuth refresh
+	// goroutine before returning so the wizard does not leak it.
+	defer drive.Close()
 	info, err := drive.EnsureFolder(ctx, folderName)
 	if err != nil {
 		return skirk.DriveConfig{}, "", fmt.Errorf("drive mailbox folder create failed: %w", err)
@@ -506,6 +509,9 @@ func validateDriveMailbox(ctx context.Context, auth skirk.AuthConfig, driveCfg s
 	if err != nil {
 		return err
 	}
+	// Validation uses a transient DriveStore; release its background OAuth
+	// refresh goroutine before returning.
+	defer drive.Close()
 	name := "setup/" + sessionID + "/marker.json"
 	if err := drive.Put(ctx, name, []byte(`{"ok":true}`)); err != nil {
 		return fmt.Errorf("drive mailbox validation upload failed: %w", err)

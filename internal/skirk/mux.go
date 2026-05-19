@@ -18,41 +18,38 @@ import (
 )
 
 const (
-	muxMagic                     = "SKM4"
-	muxVersion                   = byte(4)
-	muxBatchHeaderSize           = 7
-	muxFrameHeaderSize           = 21
-	muxFrameOpen                 = byte(1)
-	muxFrameData                 = byte(2)
-	muxFrameFIN                  = byte(3)
-	muxFrameRST                  = byte(4)
-	muxLaneCount                 = 4
-	muxMaxFrames                 = 512
-	muxMinBatch                  = 64 * 1024
-	muxMaxBatch                  = 4 * 1024 * 1024
-	muxNormalFairBatch           = 1 * 1024 * 1024
-	muxNormalBulkBatch           = 4 * 1024 * 1024
-	muxInlineFirst               = 16 * 1024
-	muxPendingFrameLimit         = 4096
-	muxUrgentFrameQueue          = 1024
-	muxNormalFrameQueue          = 128
-	muxNormalFrameQueueHard      = muxNormalFrameQueue * 4
-	muxNormalStreamQueue         = 16
-	muxNormalLaneQueueBytes      = 64 * 1024 * 1024
-	muxNormalStreamQueueBytes    = 16 * 1024 * 1024
+	muxMagic                = "SKM4"
+	muxVersion              = byte(4)
+	muxBatchHeaderSize      = 7
+	muxFrameHeaderSize      = 21
+	muxFrameOpen            = byte(1)
+	muxFrameData            = byte(2)
+	muxFrameFIN             = byte(3)
+	muxFrameRST             = byte(4)
+	muxLaneCount            = 4
+	muxMaxFrames            = 512
+	muxMinBatch             = 64 * 1024
+	muxMaxBatch             = 4 * 1024 * 1024
+	muxNormalFairBatch      = 1 * 1024 * 1024
+	muxNormalBulkBatch      = 4 * 1024 * 1024
+	muxInlineFirst          = 16 * 1024
+	muxPendingFrameLimit    = 4096
+	muxUrgentFrameQueue     = 1024
+	muxNormalFrameQueue     = 128
+	muxNormalFrameQueueHard = muxNormalFrameQueue * 4
+	muxNormalStreamQueue    = 16
+	// muxNormalLaneQueueBytes, muxNormalStreamQueueBytes, muxNormalReceiveQueueBytes,
+	// muxNormalReceiveGlobalBytes, muxPendingStreamBytes, muxPendingGlobalBytes,
+	// muxStreamPendingBytes, and muxStreamPauseBytes are declared in
+	// mux_limits_default.go (desktop/server) and mux_limits_android.go (mobile),
+	// selected via build tags so Android can use tighter caps to avoid OOM kills.
 	muxUrgentUploadQueue         = 32
 	muxNormalUploadQueue         = 1
 	muxStreamInbound             = 64
 	muxStreamInboundPause        = muxStreamInbound * 3 / 4
 	muxReceiveQueue              = 8192
-	muxNormalReceiveQueueBytes   = 64 * 1024 * 1024
-	muxNormalReceiveGlobalBytes  = 256 * 1024 * 1024
-	muxPendingStreamBytes        = 64 * 1024 * 1024
-	muxPendingGlobalBytes        = 256 * 1024 * 1024
 	muxStreamPendingFrames       = 4096
-	muxStreamPendingBytes        = 64 * 1024 * 1024
 	muxStreamPauseFrames         = 64
-	muxStreamPauseBytes          = 8 * 1024 * 1024
 	muxProcessMaxRetries         = 8
 	muxUploadMaxRetries          = 8
 	muxStartupCatchup            = 30 * time.Second
@@ -134,7 +131,6 @@ type muxObjectMeta struct {
 	Lane            int
 	Seq             uint64
 	Priority        bool
-	Plane           string
 	PlainBytes      int
 	FrameMinSeq     uint64
 	FrameMaxSeq     uint64
@@ -203,6 +199,29 @@ type muxStreamKey struct {
 	StreamID uint64
 }
 
+// seenEntry tracks when a Drive object name was last processed. Used by
+// markSeen to evict stale entries via TTL-based cleanup instead of a
+// catastrophic full-map reset that loses dedup state for legitimately
+// in-flight objects.
+type seenEntry struct {
+	seenAt time.Time
+}
+
+// muxSeqKey identifies a single authenticated mux envelope inside one
+// session. Replay defence: even if a Drive operator renames or copies a
+// sealed object, AES-GCM nonces are deterministic in (sid, dir, seq) so any
+// second appearance of the same (lane, seq) tuple — once OpenEnvelope has
+// verified the GCM tag — is by definition a replay. An attacker without the
+// per-lane key cannot produce a tuple that survives OpenEnvelope, so this
+// map is safe to consult only on authenticated traffic and cannot be
+// poisoned by Drive listings.
+type muxSeqKey struct {
+	clientID string
+	runID    string
+	lane     int
+	seq      uint64
+}
+
 type driveMux struct {
 	t         *Tunnel
 	role      string
@@ -231,8 +250,20 @@ type driveMux struct {
 	active             atomic.Int64
 
 	seenMu sync.Mutex
-	seen   map[string]struct{}
+	seen   map[string]seenEntry
 	queued map[string]struct{}
+
+	// seqSeen tracks (clientID, runID, lane, sequence) tuples that have been
+	// successfully authenticated by OpenEnvelope. Drive object *names* alone
+	// are not sufficient for replay defence: a Drive operator who can move
+	// or rename objects could re-introduce an already-decrypted envelope
+	// under a new name, and the name-based markSeen map would treat it as
+	// fresh. Because AES-GCM nonces are deterministic in (sid, dir, seq),
+	// the same (lane, seq) tuple should never legitimately appear twice in
+	// one session — and the tuple is observed only *after* OpenEnvelope
+	// succeeds, so an attacker without the lane key cannot poison this map.
+	seqSeenMu sync.Mutex
+	seqSeen   map[muxSeqKey]time.Time
 
 	listMu        sync.Mutex
 	listSince     time.Time
@@ -346,8 +377,9 @@ func newDriveMux(t *Tunnel, role string, sendDir, recvDir byte) (*driveMux, erro
 		closed:                map[muxStreamKey]time.Time{},
 		pending:               map[muxStreamKey][]muxFrame{},
 		pendingBytes:          map[muxStreamKey]int{},
-		seen:                  map[string]struct{}{},
+		seen:                  map[string]seenEntry{},
 		queued:                map[string]struct{}{},
+		seqSeen:               map[muxSeqKey]time.Time{},
 		listSince:             startedAt,
 		recvWake:              make(chan struct{}, 1),
 		recvUrgent:            make(chan muxObjectMeta, muxReceiveQueue),
@@ -3406,6 +3438,13 @@ func (m *driveMux) processMuxObject(ctx context.Context, meta muxObjectMeta) err
 	if env.Direction != m.recvDir || env.Sequence != meta.Seq || env.SessionID != m.t.SessionID {
 		return errors.New("mux envelope metadata mismatch")
 	}
+	// Belt-and-suspenders replay defence: name-based markSeen can be fooled
+	// by an operator renaming/copying a sealed Drive object, but a duplicate
+	// (lane, seq) tuple after a successful OpenEnvelope is unambiguous and
+	// must be dropped before its frames reach the stream layer.
+	if m.checkAndMarkSeqSeen(meta.ClientID, meta.RunID, meta.Lane, env.Sequence) {
+		return fmt.Errorf("mux envelope replay rejected lane=%d seq=%d", meta.Lane, env.Sequence)
+	}
 	frames, err := decodeMuxBatch(raw)
 	if err != nil {
 		return err
@@ -4046,14 +4085,97 @@ func (m *driveMux) unclaimQueued(name string) {
 	delete(m.queued, name)
 }
 
+// muxSeenSoftCap is the size at which markSeen starts compacting the dedup
+// map. Exposed as a var so tests can drive the three-stage TTL eviction
+// without having to insert 200k synthetic entries.
+var muxSeenSoftCap = 200000
+
+// markSeenTTLStages are the cutoffs used by the three-stage TTL eviction in
+// markSeen. They must be ordered from longest (gentle) to shortest
+// (aggressive). After the last stage, markSeen falls back to a catastrophic
+// reset.
+var markSeenTTLStages = []time.Duration{10 * time.Minute, 2 * time.Minute}
+
 func (m *driveMux) markSeen(name string) {
+	now := time.Now()
 	m.seenMu.Lock()
 	defer m.seenMu.Unlock()
 	delete(m.queued, name)
-	m.seen[name] = struct{}{}
-	if len(m.seen) > 200000 {
-		m.seen = map[string]struct{}{name: struct{}{}}
+	m.seen[name] = seenEntry{seenAt: now}
+	if len(m.seen) <= muxSeenSoftCap {
+		return
 	}
+	// Multi-stage TTL eviction: try progressively shorter cutoffs so we keep
+	// dedup state for legitimately in-flight Drive objects whenever possible.
+	// Drive objects are typically deleted within minutes, so old entries are
+	// safe to forget; very recent entries are kept across the first stages.
+	for _, ttl := range markSeenTTLStages {
+		cutoff := now.Add(-ttl)
+		for k, v := range m.seen {
+			if v.seenAt.Before(cutoff) {
+				delete(m.seen, k)
+			}
+		}
+		if len(m.seen) <= muxSeenSoftCap {
+			return
+		}
+	}
+	// Last resort: catastrophic reset to avoid OOM. This loses dedup state
+	// for any object still legitimately in flight, but keeps the queued
+	// entries (handled separately via the m.queued map) so re-processing is
+	// bounded.
+	m.seen = map[string]seenEntry{name: {seenAt: now}}
+}
+
+// muxSeqSeenCap bounds the per-session (lane, seq) replay map. Drive
+// envelopes typically clear out within minutes, so a generous cap is fine
+// for the legitimate steady-state and still bounds attacker-driven growth.
+// Exposed as a var so tests can drive the eviction path without inserting
+// hundreds of thousands of entries.
+var muxSeqSeenCap = 200000
+
+// muxSeqSeenTTL is the cutoff used when seqSeen exceeds muxSeqSeenCap. A
+// successfully-authenticated envelope older than this cutoff is considered
+// safe to forget: the sender has long since moved past that sequence, so
+// admitting a replay of it would only cause AES-GCM to reject it again
+// downstream (the envelope's tag would still verify but its frames would
+// race against newer state). Keeping the window much larger than typical
+// Drive object lifetimes (minutes) maintains defence in depth without
+// unbounded growth.
+var muxSeqSeenTTL = 30 * time.Minute
+
+// checkAndMarkSeqSeen returns true if this (clientID, runID, lane, seq)
+// tuple has already been processed in the current session — i.e. the
+// envelope is a replay and must be discarded. On false (first sighting) it
+// records the tuple and performs TTL-based compaction if the map has grown
+// past muxSeqSeenCap.
+func (m *driveMux) checkAndMarkSeqSeen(clientID, runID string, lane int, seq uint64) bool {
+	key := muxSeqKey{clientID: clientID, runID: runID, lane: lane, seq: seq}
+	now := time.Now()
+	m.seqSeenMu.Lock()
+	defer m.seqSeenMu.Unlock()
+	if _, ok := m.seqSeen[key]; ok {
+		return true
+	}
+	m.seqSeen[key] = now
+	if len(m.seqSeen) <= muxSeqSeenCap {
+		return false
+	}
+	cutoff := now.Add(-muxSeqSeenTTL)
+	for k, v := range m.seqSeen {
+		if v.Before(cutoff) {
+			delete(m.seqSeen, k)
+		}
+	}
+	if len(m.seqSeen) > muxSeqSeenCap {
+		// Last-resort: keep only the most-recently-recorded key. This is
+		// extremely unlikely to fire (it would require muxSeqSeenCap
+		// distinct authenticated envelopes inside one TTL window) but
+		// guarantees the map cannot grow without bound under pathological
+		// load.
+		m.seqSeen = map[muxSeqKey]time.Time{key: now}
+	}
+	return false
 }
 
 func isDrivePageTokenRejected(err error) bool {

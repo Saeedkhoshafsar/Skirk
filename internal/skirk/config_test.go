@@ -349,3 +349,59 @@ func wrapConfigPayload(payload string, width int) string {
 	b.WriteString(payload)
 	return b.String()
 }
+
+// TestTokenFromCommandStrictRefusesMetacharacters verifies that, with the
+// opt-in SKIRK_STRICT_TOKEN_COMMAND environment variable set, a configured
+// token_command containing shell metacharacters is refused before /bin/sh is
+// invoked. Without the variable the same command is allowed (with a warning)
+// so that legitimate one-liners such as `gcloud auth print-access-token`
+// keep working out of the box.
+func TestTokenFromCommandStrictRefusesMetacharacters(t *testing.T) {
+	auth := AuthConfig{TokenCommand: "echo hi; rm -rf /tmp/nope"}
+
+	t.Setenv("SKIRK_STRICT_TOKEN_COMMAND", "1")
+	if _, err := auth.tokenFromCommand(context.Background()); err == nil {
+		t.Fatalf("strict mode: expected error for metachar command, got nil")
+	} else if !strings.Contains(err.Error(), "metacharacter") {
+		t.Fatalf("strict mode: error = %v, want metacharacter refusal", err)
+	}
+
+	// "0" disables strict mode → permissive behaviour (warns and runs).
+	// We only assert that the strict-mode refusal no longer fires; the
+	// actual exec may fail for unrelated reasons (e.g. /tmp/nope), which
+	// is fine.
+	t.Setenv("SKIRK_STRICT_TOKEN_COMMAND", "0")
+	if _, err := auth.tokenFromCommand(context.Background()); err != nil &&
+		strings.Contains(err.Error(), "metacharacter") {
+		t.Fatalf("permissive mode: unexpected metachar refusal: %v", err)
+	}
+}
+
+// TestAccessTokenSourceCloseScrubsToken verifies that Close() clears the
+// cached bearer from the AccessTokenSource so a subsequent memory dump no
+// longer contains the secret reachable from a live source. Go strings are
+// immutable so this is best-effort, but the field reference itself must
+// drop.
+func TestAccessTokenSourceCloseScrubsToken(t *testing.T) {
+	src := NewAccessTokenSource(AuthConfig{AccessToken: "super-secret-bearer"}, RouteConfig{})
+	// Prime cache through the public API.
+	tok, err := src.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if tok != "super-secret-bearer" {
+		t.Fatalf("Token = %q, want primed value", tok)
+	}
+	src.Close()
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	if src.token != "" {
+		t.Fatalf("after Close: src.token = %q, want empty", src.token)
+	}
+	if src.source != "" {
+		t.Fatalf("after Close: src.source = %q, want empty", src.source)
+	}
+	if !src.expiresAt.IsZero() {
+		t.Fatalf("after Close: expiresAt = %v, want zero", src.expiresAt)
+	}
+}

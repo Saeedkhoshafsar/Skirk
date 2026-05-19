@@ -34,6 +34,9 @@ func clientUI(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Release the background OAuth refresh goroutine attached to drive's
+	// AccessTokenSource on every exit path (UI shutdown or serve error).
+	defer drive.Close()
 	tunnel, err := skirk.NewTunnel(drive, cfg)
 	if err != nil {
 		return err

@@ -83,6 +83,18 @@ func NewDriveStoreWithTokenSource(httpClient *GoogleHTTPClient, tokenSource *Acc
 	return &DriveStore{http: httpClient, tokenSource: tokenSource, folderID: folderID, space: space, quota: newDriveQuotaStats(driveQuotaLogInterval()), backoff: newDriveQuotaBackoff()}
 }
 
+// Close releases resources held by the DriveStore, including cancelling
+// any in-flight background token refresh. The DriveStore must not be used
+// after Close returns. Safe to call multiple times and on a nil receiver.
+func (d *DriveStore) Close() {
+	if d == nil {
+		return
+	}
+	if d.tokenSource != nil {
+		d.tokenSource.Close()
+	}
+}
+
 func (d *DriveStore) Put(ctx context.Context, name string, data []byte) error {
 	_, err := d.PutObject(ctx, name, data)
 	return err

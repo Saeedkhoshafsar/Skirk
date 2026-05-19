@@ -1,6 +1,87 @@
 # Changelog
 
-## Unreleased
+## v0.1.52 - 2026-05-19
+
+### BREAKING
+
+- **SOCKS LAN bind now requires opt-in**: the unauthenticated SOCKS server
+  refuses to start on a non-loopback listen address (e.g. `0.0.0.0:1080`,
+  any IPv6 ULA, or a LAN IP) unless the caller explicitly sets
+  `SOCKSServer.AllowLANListen = true`. Deployments that intentionally
+  exposed the SOCKS listener to other hosts will fail to start after
+  upgrading until the opt-in flag is set or the listen address is moved
+  back to loopback. This closes the "unauthenticated SOCKS open relay on
+  the local network" footgun for default configurations.
+
+### Memory and reliability
+
+- Added Android-specific mux buffer caps via build tags
+  (`mux_limits_android.go` vs `mux_limits_default.go`) so mobile builds use
+  ~128 MiB of mux buffering instead of ~1 GiB, avoiding the platform
+  low-memory killer on 2–4 GB devices while keeping desktop/server throughput
+  unchanged. The active mux limits are now logged once at tunnel startup so
+  the chosen profile is visible in field debug captures.
+- Replaced the `markSeen` catastrophic full-map reset with a TTL-based
+  three-stage eviction (10 min → 2 min → reset) so dedup state for
+  legitimately in-flight Drive objects survives high-traffic bursts.
+- Added a `Close()` method to `AccessTokenSource` and `DriveStore` so the
+  background OAuth-refresh goroutine is cancelled cleanly on shutdown
+  instead of leaking past tunnel exit, and wired `defer drive.Close()`
+  into every `cmd/skirk` command that opens a DriveStore
+  (`serve-client`, `serve-exit`, `client-ui`, `cleanup`, `bench-live`,
+  `bench-drive`, and setup mailbox create/validate). Also fixed a latent
+  leak in `StoresFromConfig` where a failed initial `Token()` call would
+  drop the token source without cancelling its context.
+
+### Routing and config
+
+- Added an optional `Role` field to `Config` so `ApplyDefaults` can pick
+  per-role defaults (e.g. `route.mode = "direct"` for exit nodes,
+  `real_pinned` for clients). Existing configs without `role` behave as
+  before. The same role is now propagated into the tunnel up front so
+  worker-count and limiter-window calculations have the correct role from
+  the very first acquire.
+
+### Security
+
+- Capped Drive HTTP response bodies at 32 MiB (`io.LimitReader`) to prevent
+  a malicious or buggy endpoint from forcing unbounded allocations.
+- Logged a warning when `token_command` contains shell metacharacters, to
+  surface accidental injection vectors when the value comes from untrusted
+  input, and added an opt-in `SKIRK_STRICT_TOKEN_COMMAND=1` environment
+  variable that escalates the warning to a hard refusal so deployments that
+  load configs from shared/untrusted sources can fail closed instead of
+  exec'ing the suspicious string under `/bin/sh -lc`.
+- Scrubbed the cached OAuth bearer from `AccessTokenSource.Close()` (the
+  `token`, `source`, and `expiresAt` fields) so a memory dump captured
+  after shutdown no longer surfaces the secret reachable from a live
+  source. Go strings are immutable so the original heap object is best-
+  effort, but no live `AccessTokenSource` retains the reference after
+  Close.
+- Added a per-session `(clientID, runID, lane, sequence)` replay map in
+  `driveMux` that runs *after* `OpenEnvelope` authenticates a sealed Drive
+  object. The pre-existing name-based `markSeen` map can be evaded by a
+  Drive operator who renames or copies an envelope; the sequence-keyed
+  map cannot, because the tuple is observed only post-AEAD verification.
+  The map is TTL-compacted at 30 minutes with a 200 000-entry cap so it
+  cannot grow without bound.
+
+### Cleanup and tests
+
+- Removed the unused `Plane` field from `muxObjectMeta` and the redundant
+  `Dialer.Timeout` in `dialDirectExitTarget` (the surrounding
+  `context.WithTimeout` is already authoritative).
+- Simplified `tokenNeedsRefreshForRoute` so the boundary `lifetime == margin`
+  case is handled by a single `<=` comparison instead of two equivalent
+  branches.
+- Added regression coverage for the three-stage `markSeen` TTL eviction
+  (10-minute compaction first, then 2-minute compaction, then last-resort
+  reset) and for AES-GCM nonce uniqueness.
+- Added regression coverage for the new `(lane, seq)` replay defence
+  (`TestCheckAndMarkSeqSeenDetectsReplay`, `…EvictsByTTL`) and for the
+  strict `token_command` refusal and `AccessTokenSource.Close` token
+  scrub (`TestTokenFromCommandStrictRefusesMetacharacters`,
+  `TestAccessTokenSourceCloseScrubsToken`).
 
 ## v0.1.51 - 2026-05-19
 

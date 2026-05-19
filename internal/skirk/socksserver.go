@@ -18,6 +18,10 @@ type SOCKSServer struct {
 	Listen  string
 	Handler SOCKSHandler
 	Logger  *log.Logger
+	// AllowLANListen, when true, permits binding to non-loopback addresses.
+	// By default the server refuses to start on non-loopback to prevent
+	// accidentally exposing an unauthenticated proxy to the local network.
+	AllowLANListen bool
 }
 
 type socksRequest struct {
@@ -26,6 +30,19 @@ type socksRequest struct {
 }
 
 func (s *SOCKSServer) Serve(ctx context.Context) error {
+	// Refuse to start an unauthenticated SOCKS proxy on a non-loopback
+	// address. Doing so would expose an open proxy to the entire local
+	// network. If LAN access is intentional, the caller must set
+	// AllowLANListen = true.
+	if host, _, err := net.SplitHostPort(s.Listen); err == nil {
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !s.AllowLANListen {
+			return fmt.Errorf(
+				"refusing to start unauthenticated SOCKS proxy on non-loopback address %s; "+
+					"set AllowLANListen = true if you intend to expose the proxy to your local network",
+				s.Listen,
+			)
+		}
+	}
 	listener, err := net.Listen("tcp", s.Listen)
 	if err != nil {
 		return err
