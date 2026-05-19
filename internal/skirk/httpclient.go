@@ -103,6 +103,11 @@ func NewGoogleHTTPClient(route RouteConfig) *GoogleHTTPClient {
 			},
 			ReadIdleTimeout: 30 * time.Second,
 			PingTimeout:     15 * time.Second,
+			// Larger flow-control window so a single HTTP/2 connection
+			// can carry multiple concurrent Drive media downloads without
+			// stalling on WINDOW_UPDATE round-trips. The default (64 KiB)
+			// is fine for control RPCs but limiting for bulk media reads.
+			MaxReadFrameSize: 1 << 20, // 1 MiB
 		}
 		return &GoogleHTTPClient{
 			client: &http.Client{Transport: transport, Timeout: time.Duration(route.TimeoutSeconds) * time.Second},
@@ -136,15 +141,33 @@ func NewGoogleHTTPClient(route RouteConfig) *GoogleHTTPClient {
 		return uconn, nil
 	}
 	transport := &http.Transport{
-		DialContext:           dialContext,
-		ForceAttemptHTTP2:     !isGoogleFrontHTTP1Route(route.Mode),
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   64,
-		IdleConnTimeout:       90 * time.Second,
+		DialContext: dialContext,
+		ForceAttemptHTTP2: !isGoogleFrontHTTP1Route(route.Mode),
+		// Increased from 256/64 to 512/128 in v0.1.53 so a multi-mailbox
+		// pool (each mailbox warms its own session against the same Google
+		// host) does not starve concurrent upload/download workers of
+		// pre-warmed connections. The extra idle conns cost ~1.5 KiB of
+		// kernel buffers each, well within the budget for the desktop/
+		// server profile that already buffers 256 MiB of mux receive
+		// queue.
+		MaxIdleConns:        512,
+		MaxIdleConnsPerHost: 128,
+		// Bumped idle timeout from 90s to 120s so a tunnel with a slow
+		// burst-poll cadence (poll_interval_ms=5000) still has its TLS
+		// connections warm between polls instead of paying handshake
+		// latency on every list call.
+		IdleConnTimeout:       120 * time.Second,
 		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: time.Duration(route.TimeoutSeconds) * time.Second,
 		ExpectContinueTimeout: 0,
 		TLSClientConfig:       &stdtls.Config{MinVersion: stdtls.VersionTLS12},
+		// Larger socket buffers cut syscall count on bulk uploads/downloads
+		// where the mux ships 1–4 MiB objects through Drive. 64 KiB matches
+		// the default Linux TCP receive buffer ceiling without auto-tuning
+		// and avoids forcing the kernel into many tiny read/write
+		// fragments per Drive request.
+		WriteBufferSize: 64 * 1024,
+		ReadBufferSize:  64 * 1024,
 	}
 	if isGoogleFrontHTTP1Route(route.Mode) {
 		transport.DialTLSContext = tlsDialContext
