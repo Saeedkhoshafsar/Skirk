@@ -258,7 +258,7 @@ jobs:
           fi
           stale_android_asset="skirk-${GITHUB_REF_NAME}-android-arm64.apk"
           stale_android_checksum="${stale_android_asset}.sha256"
-          release_notes=$'Assets:\n- Skirk_windows_x64_portable.zip: Windows GUI portable app with proxy, system proxy, and VPN modes. Extract it and open Skirk.exe.\n- skirk-windows-amd64.zip: Windows CLI-only build for PowerShell/manual use.\n- skirk-android-arm64.apk: release-signed Android arm64 APK for sideloading.\n\nIntegrity:\n- SHA256SUMS covers the published archives/APK.\n- GitHub artifact attestations are generated for the APK and archives; verify with `gh attestation verify <asset> -R ShahabSL/Skirk`.\n'
+          release_notes=$'Assets:\n- Skirk_windows_x64_portable.zip: Windows GUI portable app with proxy, system proxy, and VPN modes. Extract it and open Skirk.exe.\n- skirk-windows-amd64.zip: Windows CLI-only build for PowerShell/manual use.\n- skirk-android-arm64.apk: release-signed Android arm64 APK for sideloading.\n\nIntegrity:\n- SHA256SUMS covers the published archives/APK.\n- GitHub artifact attestations are generated for the APK and archives; verify with `gh attestation verify <asset> -R '"${GITHUB_REPOSITORY}"$'`.\n'
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             existing_assets="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
             for stale in "${stale_android_asset}" "${stale_android_checksum}"; do
