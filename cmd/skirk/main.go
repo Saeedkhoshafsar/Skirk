@@ -105,6 +105,8 @@ func run(args []string) error {
 		return serveExit(ctx, args[2:])
 	case "sample-config":
 		return sampleConfig(args[2:])
+	case "web":
+		return webCommand(ctx, args[2:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[1])
@@ -137,7 +139,8 @@ func usage() {
   revoke --config skirk-kit/exit.json [--revoke-oauth]
   serve-exit --config skirk.json [--exit-proxy socks5h://127.0.0.1:40000]
   serve-client --config skirk.json [--listen 127.0.0.1:18080] [--client-id my-device]
-  client-ui --config skirk.json [--socks 127.0.0.1:18080] [--ui 127.0.0.1:18280]`)
+  client-ui --config skirk.json [--socks 127.0.0.1:18080] [--ui 127.0.0.1:18280]
+  web [--port 8787] [--bind 127.0.0.1] [--kit skirk-kit] [--token TOKEN] [--no-auth] [--tls-cert cert.pem --tls-key key.pem]`)
 }
 
 func configCommand(args []string) error {
