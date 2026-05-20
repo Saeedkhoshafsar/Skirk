@@ -381,8 +381,97 @@ func TestStaticIndex_Served(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Fatalf("expected text/html content type, got %q", ct)
 	}
-	if !strings.Contains(w.Body.String(), "Skirk") {
-		t.Fatalf("index.html should mention Skirk; got: %s", w.Body.String()[:min(200, len(w.Body.String()))])
+	body := w.Body.String()
+	if !strings.Contains(body, "Skirk") {
+		t.Fatalf("index.html should mention Skirk; got: %s", body[:min(200, len(body))])
+	}
+	// Step 2-a dashboard ships the Alpine shell and references its assets.
+	// These string checks guard against accidentally regressing to the
+	// PR #1 placeholder, which would not load any dashboard at all.
+	wantRefs := []string{
+		`x-data="app()"`,        // Alpine root component
+		`/vendor/alpine.min.js`, // embedded Alpine.js bundle
+		`/app.js`,               // dashboard logic
+		`/styles.css`,           // stylesheet
+	}
+	for _, ref := range wantRefs {
+		if !strings.Contains(body, ref) {
+			t.Errorf("index.html missing expected reference %q", ref)
+		}
+	}
+}
+
+// TestStatic_DashboardAssets ensures every asset the dashboard depends on
+// is reachable through the embed.FS — a single missing file would break the
+// UI at runtime in a hard-to-debug way (blank page + console 404s).
+func TestStatic_DashboardAssets(t *testing.T) {
+	s := newTestServer(t, AuthConfig{NoAuth: true}, &fakeOps{})
+	cases := []struct {
+		path        string
+		wantCT      string
+		wantSubstr  string
+		minByteSize int
+	}{
+		{"/app.js", "javascript", "function app()", 5000},
+		{"/styles.css", "text/css", ".app-shell", 2000},
+		{"/vendor/alpine.min.js", "javascript", "", 10000},
+		{"/i18n/en.json", "json", `"app.title"`, 500},
+		{"/i18n/fa.json", "json", `"app.title"`, 500},
+		{"/favicon.svg", "image", "<svg", 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			w := doRequest(t, s.Handler(), http.MethodGet, tc.path, nil, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s: expected 200, got %d", tc.path, w.Code)
+			}
+			if tc.wantCT != "" {
+				if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, tc.wantCT) {
+					t.Errorf("%s: expected content-type containing %q, got %q",
+						tc.path, tc.wantCT, ct)
+				}
+			}
+			if tc.wantSubstr != "" && !strings.Contains(w.Body.String(), tc.wantSubstr) {
+				t.Errorf("%s: expected body to contain %q", tc.path, tc.wantSubstr)
+			}
+			if w.Body.Len() < tc.minByteSize {
+				t.Errorf("%s: body suspiciously small (%d bytes < %d)",
+					tc.path, w.Body.Len(), tc.minByteSize)
+			}
+		})
+	}
+}
+
+// TestStatic_I18nKeysMatch sanity-checks the two translation bundles ship
+// the same set of top-level keys. A diverging key set is almost always a
+// translation bug.
+func TestStatic_I18nKeysMatch(t *testing.T) {
+	s := newTestServer(t, AuthConfig{NoAuth: true}, &fakeOps{})
+	load := func(p string) map[string]any {
+		w := doRequest(t, s.Handler(), http.MethodGet, p, nil, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: HTTP %d", p, w.Code)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+			t.Fatalf("%s: invalid JSON: %v", p, err)
+		}
+		return m
+	}
+	en := load("/i18n/en.json")
+	fa := load("/i18n/fa.json")
+	// Ignore the `_meta` block which is intentionally per-language.
+	delete(en, "_meta")
+	delete(fa, "_meta")
+	for k := range en {
+		if _, ok := fa[k]; !ok {
+			t.Errorf("fa.json missing key %q present in en.json", k)
+		}
+	}
+	for k := range fa {
+		if _, ok := en[k]; !ok {
+			t.Errorf("en.json missing key %q present in fa.json", k)
+		}
 	}
 }
 

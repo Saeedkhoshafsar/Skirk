@@ -1,26 +1,378 @@
 <!DOCTYPE html>
-<html lang="en">
+<!--
+  Skirk Web UI — single-page Alpine.js dashboard.
+
+  Loaded as an embed.FS asset by internal/skirk/web/embed.go. All assets
+  (Alpine.js, app.js, styles.css, i18n bundles) ship inside the binary;
+  this page references them with absolute paths served at /.
+
+  The page renders three states driven by Alpine's `view` store:
+    1) loading  – initial probe while we decide whether a session exists
+    2) login    – ask for the web token (or accept it from URL hash)
+    3) app      – full dashboard
+
+  Direction (rtl/ltr) is set on <html> from the active i18n bundle.
+-->
+<html lang="en" dir="ltr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Skirk Web UI</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; background: #0f1115; color: #e6e6e6;
-           display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-    .box { max-width: 560px; padding: 32px; background: #1a1d24; border-radius: 12px;
-           box-shadow: 0 4px 20px rgba(0,0,0,0.3); text-align: center; }
-    h1 { margin-top: 0; color: #7fb3ff; }
-    code { background: #2a2d34; padding: 2px 6px; border-radius: 4px; }
-    a { color: #7fb3ff; }
-  </style>
+  <title>Skirk</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
-  <div class="box">
-    <h1>🌿 Skirk Web UI</h1>
-    <p>The backend is online. The full dashboard ships in the next step.</p>
-    <p>Try the API:</p>
-    <p><code>GET /api/status</code></p>
-    <p><a href="/api/status">/api/status</a></p>
+<body x-data="app()" x-init="init()" x-cloak>
+
+  <!-- ============== LOADING ============== -->
+  <template x-if="view === 'loading'">
+    <div class="login">
+      <div class="login__card">
+        <p x-text="t('common.loading')"></p>
+      </div>
+    </div>
+  </template>
+
+  <!-- ============== LOGIN ============== -->
+  <template x-if="view === 'login'">
+    <div class="login">
+      <form class="login__card" @submit.prevent="doLogin()">
+        <h1 class="login__title" x-text="t('login.title')"></h1>
+        <p class="login__intro" x-text="t('login.intro')"></p>
+        <p class="login__intro" x-show="loginPrefilled" x-text="t('login.hint.from_url')"></p>
+
+        <div class="form-row">
+          <label for="login-token" x-text="t('login.token.label')"></label>
+          <input id="login-token" type="password" class="input"
+                 :placeholder="t('login.token.placeholder')"
+                 x-model="loginToken"
+                 :disabled="loginBusy"
+                 autocomplete="off" autofocus>
+          <p class="form-row__error" x-show="loginError" x-text="loginError"></p>
+        </div>
+
+        <button type="submit" class="btn btn--primary" :disabled="loginBusy || !loginToken">
+          <span x-show="!loginBusy" x-text="t('login.submit')"></span>
+          <span x-show="loginBusy"  x-text="t('login.signing_in')"></span>
+        </button>
+
+        <div style="margin-top:18px; display:flex; gap:8px; justify-content:flex-end;">
+          <div class="segmented" role="group" :aria-label="t('nav.language')">
+            <template x-for="code in ['en','fa']" :key="code">
+              <button type="button"
+                      :aria-pressed="lang === code"
+                      @click="setLang(code)"
+                      x-text="code.toUpperCase()"></button>
+            </template>
+          </div>
+        </div>
+      </form>
+    </div>
+  </template>
+
+  <!-- ============== APP ============== -->
+  <template x-if="view === 'app'">
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="app-header__brand">
+          <img src="/favicon.svg" alt="">
+          <span x-text="t('app.title')"></span>
+        </div>
+        <div class="app-header__spacer"></div>
+        <div class="app-header__controls">
+          <!-- theme switcher -->
+          <div class="segmented" role="group" aria-label="theme">
+            <button type="button" :aria-pressed="theme === 'auto'"
+                    @click="setTheme('auto')"  x-text="t('nav.theme.auto')"></button>
+            <button type="button" :aria-pressed="theme === 'light'"
+                    @click="setTheme('light')" x-text="t('nav.theme.light')"></button>
+            <button type="button" :aria-pressed="theme === 'dark'"
+                    @click="setTheme('dark')"  x-text="t('nav.theme.dark')"></button>
+          </div>
+          <!-- lang switcher -->
+          <div class="segmented" role="group" :aria-label="t('nav.language')">
+            <template x-for="code in ['en','fa']" :key="code">
+              <button type="button" :aria-pressed="lang === code"
+                      @click="setLang(code)" x-text="code.toUpperCase()"></button>
+            </template>
+          </div>
+          <button class="btn btn--ghost btn--sm" @click="doLogout()" x-text="t('nav.logout')"></button>
+        </div>
+      </header>
+
+      <main class="app-main">
+
+        <!-- ===== Status ===== -->
+        <section class="card" aria-labelledby="status-h">
+          <header class="card__header">
+            <h2 id="status-h" class="card__title" x-text="t('status.title')"></h2>
+            <div class="card__actions">
+              <button class="btn btn--sm" @click="refreshAll()" :disabled="loading"
+                      x-text="t('status.refresh')"></button>
+            </div>
+          </header>
+          <dl class="kv" x-show="status">
+            <dt x-text="t('status.version')"></dt>
+            <dd x-text="(status?.version || '') + (status?.commit && status.commit !== 'unknown' ? ' (' + status.commit.slice(0,7) + ')' : '')"></dd>
+
+            <dt x-text="t('status.go_version')"></dt>
+            <dd x-text="status?.go_version || '—'"></dd>
+
+            <dt x-text="t('status.platform')"></dt>
+            <dd x-text="(status?.os || '—') + '/' + (status?.arch || '—')"></dd>
+
+            <dt x-text="t('status.kit_dir')"></dt>
+            <dd><code x-text="status?.kit_dir || '—'"></code></dd>
+
+            <dt x-text="t('status.uptime')"></dt>
+            <dd x-text="formatUptime(status?.uptime_seconds)"></dd>
+
+            <dt x-text="t('status.mailbox_count')"></dt>
+            <dd x-text="status?.mailbox_count ?? '—'"></dd>
+          </dl>
+        </section>
+
+        <!-- ===== Client profile ===== -->
+        <section class="card" aria-labelledby="cp-h">
+          <header class="card__header">
+            <h2 id="cp-h" class="card__title" x-text="t('client_profile.title')"></h2>
+          </header>
+          <p class="form-row__help" x-text="t('client_profile.hint')"></p>
+          <template x-if="clientProfile">
+            <div class="client-profile__box">
+              <code x-text="clientProfile"></code>
+              <button class="btn btn--sm" @click="copy(clientProfile, 'client_profile.copied')"
+                      x-text="t('client_profile.copy')"></button>
+            </div>
+          </template>
+          <template x-if="!clientProfile">
+            <p class="form-row__help" x-text="t('client_profile.empty')"></p>
+          </template>
+        </section>
+
+        <!-- ===== Mailboxes ===== -->
+        <section class="card" aria-labelledby="mb-h">
+          <header class="card__header">
+            <h2 id="mb-h" class="card__title">
+              <span x-text="t('mailboxes.title')"></span>
+              <span style="color:var(--fg-muted); font-weight:400; font-size:0.85rem; margin-inline-start:8px;"
+                    x-text="tt('mailboxes.count', { count: extrasCount, max: MAX_EXTRAS })"></span>
+            </h2>
+            <div class="card__actions">
+              <button class="btn btn--sm" @click="loadMailboxes()" :disabled="loading"
+                      x-text="t('mailboxes.refresh')"></button>
+              <button class="btn btn--sm btn--primary" @click="openAddModal()"
+                      :disabled="extrasCount >= MAX_EXTRAS"
+                      x-text="t('mailboxes.add')"></button>
+            </div>
+          </header>
+
+          <template x-if="mailboxes.length === 0 && !loading">
+            <div class="mailboxes__empty">
+              <p><strong x-text="t('mailboxes.empty.title')"></strong></p>
+              <p x-text="t('mailboxes.empty.body')"></p>
+              <p><code x-text="t('mailboxes.empty.cli')"></code></p>
+            </div>
+          </template>
+
+          <div class="mailboxes__grid" x-show="mailboxes.length > 0">
+            <template x-for="mb in mailboxes" :key="mb.label || mb.folder_id">
+              <article class="mailbox">
+                <header class="mailbox__head">
+                  <div class="mailbox__label" x-text="mb.label || '(unnamed)'"></div>
+                  <span class="mailbox__badge"
+                        :class="mb.is_primary ? 'mailbox__badge--primary' : ''"
+                        x-text="mb.is_primary ? t('mailboxes.badge.primary') : t('mailboxes.badge.extra')"></span>
+                </header>
+                <div class="mailbox__meta">
+                  <div>
+                    <span x-text="t('mailboxes.field.folder')"></span>:
+                    <code x-text="truncMiddle(mb.folder_id, 28)" :title="mb.folder_id"></code>
+                  </div>
+                  <div>
+                    <span x-text="t('mailboxes.field.oauth')"></span>:
+                    <span x-text="oauthLabel(mb.oauth_mode)"></span>
+                  </div>
+                  <template x-if="mb.account">
+                    <div>
+                      <span x-text="t('mailboxes.field.account')"></span>:
+                      <span x-text="mb.account"></span>
+                    </div>
+                  </template>
+                </div>
+                <div class="mailbox__actions">
+                  <button class="btn btn--sm" @click="openEditModal(mb)"
+                          x-text="t('mailboxes.action.edit')"></button>
+                  <button class="btn btn--sm" x-show="!mb.is_primary"
+                          @click="openPromoteModal(mb)"
+                          x-text="t('mailboxes.action.promote')"></button>
+                  <button class="btn btn--sm btn--danger" x-show="!mb.is_primary"
+                          @click="openRemoveModal(mb)"
+                          x-text="t('mailboxes.action.remove')"></button>
+                </div>
+              </article>
+            </template>
+          </div>
+        </section>
+
+      </main>
+
+      <!-- ===== Modal: Add mailbox (UI stub for step 2-a) ===== -->
+      <template x-if="modal === 'add'">
+        <div class="modal-backdrop" @click.self="closeModal()">
+          <div class="modal" role="dialog" aria-modal="true">
+            <header class="modal__header">
+              <h3 class="modal__title" x-text="t('add.title')"></h3>
+              <button class="btn btn--ghost btn--sm" @click="closeModal()"
+                      x-text="t('common.close')"></button>
+            </header>
+            <div class="modal__body">
+
+              <template x-if="extrasCount >= MAX_EXTRAS">
+                <div class="notice"
+                     x-text="tt('add.limit_reached', { max: MAX_EXTRAS })"></div>
+              </template>
+
+              <div class="form-row">
+                <label for="add-label" x-text="t('add.step.label')"></label>
+                <input id="add-label" class="input"
+                       :class="addLabelError ? 'input--invalid' : ''"
+                       :placeholder="t('add.step.label.placeholder')"
+                       x-model="addForm.label"
+                       @input="validateAddLabel()">
+                <p class="form-row__help" x-text="t('add.step.label.help')"></p>
+                <p class="form-row__error" x-show="addLabelError" x-text="addLabelError"></p>
+              </div>
+
+              <div class="form-row">
+                <label x-text="t('add.step.oauth')"></label>
+                <div class="radio-group">
+                  <label>
+                    <input type="radio" value="easy" x-model="addForm.oauth_mode">
+                    <span x-text="t('add.step.oauth.easy')"></span>
+                  </label>
+                  <label>
+                    <input type="radio" value="personal" x-model="addForm.oauth_mode">
+                    <span x-text="t('add.step.oauth.personal')"></span>
+                  </label>
+                </div>
+              </div>
+
+              <template x-if="addForm.oauth_mode === 'personal'">
+                <div>
+                  <div class="form-row">
+                    <label for="add-client-id" x-text="t('add.step.personal.id')"></label>
+                    <input id="add-client-id" class="input"
+                           x-model="addForm.client_id" autocomplete="off">
+                  </div>
+                  <div class="form-row">
+                    <label for="add-client-secret" x-text="t('add.step.personal.secret')"></label>
+                    <input id="add-client-secret" class="input" type="password"
+                           x-model="addForm.client_secret" autocomplete="off">
+                  </div>
+                  <p class="form-row__help" x-text="t('add.step.personal.help')"></p>
+                </div>
+              </template>
+
+              <!-- The actual OAuth+Add flow ships in step 2-b. For now we show
+                   a clear notice + a copy-friendly CLI command. -->
+              <template x-if="addShowCliHint">
+                <div class="notice">
+                  <div class="notice__title" x-text="t('add.cli_notice.title')"></div>
+                  <div x-text="t('add.cli_notice.body')"></div>
+                  <pre><code x-text="tt('add.cli_notice.example', { label: addForm.label || 'my-mailbox' })"></code></pre>
+                  <div style="display:flex; gap:6px; margin-top:8px;">
+                    <button class="btn btn--sm"
+                            @click="copy(tt('add.cli_notice.example', { label: addForm.label || 'my-mailbox' }), 'toast.copied')"
+                            x-text="t('add.cli_notice.copy')"></button>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <footer class="modal__footer">
+              <button class="btn" @click="closeModal()" x-text="t('common.cancel')"></button>
+              <button class="btn btn--primary"
+                      :disabled="!!addLabelError || !addForm.label || extrasCount >= MAX_EXTRAS"
+                      @click="submitAdd()"
+                      x-text="t('add.submit')"></button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <!-- ===== Modal: Edit (rename) ===== -->
+      <template x-if="modal === 'edit'">
+        <div class="modal-backdrop" @click.self="closeModal()">
+          <div class="modal" role="dialog" aria-modal="true">
+            <header class="modal__header">
+              <h3 class="modal__title" x-text="t('edit.title')"></h3>
+              <button class="btn btn--ghost btn--sm" @click="closeModal()"
+                      x-text="t('common.close')"></button>
+            </header>
+            <div class="modal__body">
+              <div class="form-row">
+                <label for="edit-label" x-text="t('edit.label.label')"></label>
+                <input id="edit-label" class="input"
+                       :class="editLabelError ? 'input--invalid' : ''"
+                       x-model="editForm.newLabel"
+                       @input="validateEditLabel()">
+                <p class="form-row__help" x-text="t('edit.label.help')"></p>
+                <p class="form-row__error" x-show="editLabelError" x-text="editLabelError"></p>
+              </div>
+            </div>
+            <footer class="modal__footer">
+              <button class="btn" @click="closeModal()" :disabled="busy"
+                      x-text="t('common.cancel')"></button>
+              <button class="btn btn--primary"
+                      :disabled="busy || !!editLabelError || !editForm.newLabel || editForm.newLabel === editForm.target"
+                      @click="submitEdit()">
+                <span x-show="!busy" x-text="t('edit.submit')"></span>
+                <span x-show="busy" x-text="t('common.saving')"></span>
+              </button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+      <!-- ===== Modal: Confirm (remove / promote) ===== -->
+      <template x-if="modal === 'confirm'">
+        <div class="modal-backdrop" @click.self="closeModal()">
+          <div class="modal" role="dialog" aria-modal="true">
+            <header class="modal__header">
+              <h3 class="modal__title"
+                  x-text="confirmKind === 'remove' ? t('confirm.remove.title') : t('confirm.promote.title')"></h3>
+              <button class="btn btn--ghost btn--sm" @click="closeModal()"
+                      x-text="t('common.close')"></button>
+            </header>
+            <div class="modal__body">
+              <p x-text="tt(confirmKind === 'remove' ? 'confirm.remove.body' : 'confirm.promote.body', { label: confirmTarget })"></p>
+            </div>
+            <footer class="modal__footer">
+              <button class="btn" @click="closeModal()" :disabled="busy"
+                      x-text="t('common.cancel')"></button>
+              <button class="btn"
+                      :class="confirmKind === 'remove' ? 'btn--danger' : 'btn--primary'"
+                      :disabled="busy"
+                      @click="submitConfirm()">
+                <span x-show="!busy"
+                      x-text="confirmKind === 'remove' ? t('confirm.remove.submit') : t('confirm.promote.submit')"></span>
+                <span x-show="busy" x-text="t('common.working')"></span>
+              </button>
+            </footer>
+          </div>
+        </div>
+      </template>
+
+    </div>
+  </template>
+
+  <!-- ============== TOASTS (always mounted) ============== -->
+  <div class="toasts" aria-live="polite">
+    <template x-for="t in toasts" :key="t.id">
+      <div class="toast" :class="'toast--' + t.kind" x-text="t.msg"></div>
+    </template>
   </div>
+
+  <script src="/vendor/alpine.min.js" defer></script>
+  <script src="/app.js"></script>
 </body>
 </html>
