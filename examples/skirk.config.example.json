@@ -1,0 +1,24 @@
+{
+  "secret": "base64:REPLACE_WITH_OUTPUT_FROM_SKIRK_KEYGEN",
+  "session_id": "00112233445566778899aabbccddeeff",
+  "auth": {
+    "token_command": "gcloud auth print-access-token"
+  },
+  "route": {
+    "mode": "google_front",
+    "proxy": "socks5h://127.0.0.1:1080",
+    "google_ip": "216.239.38.120",
+    "timeout_seconds": 240
+  },
+  "drive": {
+    "space": "appDataFolder"
+  },
+  "tunnel": {
+    "listen": "127.0.0.1:18080",
+    "profile": "auto",
+    "chunk_size": 16777216,
+    "poll_interval_ms": 250,
+    "concurrency": 8,
+    "cleanup_processed": true
+  }
+}

@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+jobs:
+  release:
+    name: Build CLI Release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure Git default branch
+        run: git config --global init.defaultBranch main
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build release archives
+        env:
+          SKIRK_OAUTH_CLIENT_ID: ${{ secrets.SKIRK_OAUTH_CLIENT_ID }}
+          SKIRK_OAUTH_CLIENT_SECRET: ${{ secrets.SKIRK_OAUTH_CLIENT_SECRET }}
+          SKIRK_REQUIRE_BUILTIN_OAUTH: "1"
+        run: VERSION="${GITHUB_REF_NAME}" scripts/package_release.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-release
+          path: |
+            dist/skirk-*.tar.gz
+            dist/skirk-*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  android:
+    name: Build Signed Android Client
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure Git default branch
+        run: git config --global init.defaultBranch main
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973"
+
+      - name: Decode Android release keystore
+        env:
+          SKIRK_ANDROID_KEYSTORE_BASE64: ${{ secrets.SKIRK_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "${SKIRK_ANDROID_KEYSTORE_BASE64}" ]; then
+            echo "SKIRK_ANDROID_KEYSTORE_BASE64 is required for release APK signing" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/skirk-android-signing"
+          printf '%s' "$SKIRK_ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/skirk-android-signing/release.jks"
+
+      - name: Build signed release APK
+        working-directory: clients/android
+        env:
+          SKIRK_ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/skirk-android-signing/release.jks
+          SKIRK_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SKIRK_ANDROID_KEYSTORE_PASSWORD }}
+          SKIRK_ANDROID_KEY_ALIAS: ${{ secrets.SKIRK_ANDROID_KEY_ALIAS }}
+          SKIRK_ANDROID_KEY_PASSWORD: ${{ secrets.SKIRK_ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$SKIRK_ANDROID_KEYSTORE_PASSWORD"
+          test -n "$SKIRK_ANDROID_KEY_ALIAS"
+          test -n "$SKIRK_ANDROID_KEY_PASSWORD"
+          ./gradlew :app:assembleRelease -Pskirk.version="${GITHUB_REF_NAME#v}" --console=plain
+
+      - name: Verify release APK signature
+        run: |
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
+          test -n "$apksigner"
+          "$apksigner" verify --print-certs clients/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Prepare Android release APK
+        run: |
+          mkdir -p dist/android
+          cp clients/android/app/build/outputs/apk/release/app-release.apk dist/android/skirk-android-arm64.apk
+          (cd dist/android && sha256sum skirk-android-arm64.apk > skirk-android-arm64.apk.sha256)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-release
+          path: |
+            dist/android/skirk-android-arm64.apk
+            dist/android/skirk-android-arm64.apk.sha256
+          if-no-files-found: error
+
+  windows-desktop:
+    name: Build Windows Desktop Client
+    runs-on: windows-2022
+    steps:
+      - name: Configure Git default branch
+        run: git config --global init.defaultBranch main
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Skirk Windows sidecar
+        shell: pwsh
+        env:
+          SKIRK_OAUTH_CLIENT_ID: ${{ secrets.SKIRK_OAUTH_CLIENT_ID }}
+          SKIRK_OAUTH_CLIENT_SECRET: ${{ secrets.SKIRK_OAUTH_CLIENT_SECRET }}
+          SKIRK_REQUIRE_BUILTIN_OAUTH: "1"
+        run: |
+          New-Item -ItemType Directory -Force clients/desktop/src-tauri/resources/sidecars/windows | Out-Null
+          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $commit = "${env:GITHUB_SHA}".Substring(0, 7)
+          $ldflags = "-s -w -X main.version=${env:GITHUB_REF_NAME} -X main.commit=$commit -X main.date=$date"
+          if ($env:SKIRK_REQUIRE_BUILTIN_OAUTH -eq "1" -and (-not $env:SKIRK_OAUTH_CLIENT_ID -or -not $env:SKIRK_OAUTH_CLIENT_SECRET)) {
+            throw "release builds require SKIRK_OAUTH_CLIENT_ID and SKIRK_OAUTH_CLIENT_SECRET for the built-in device-code OAuth client"
+          }
+          if ($env:SKIRK_OAUTH_CLIENT_ID -or $env:SKIRK_OAUTH_CLIENT_SECRET) {
+            if (-not $env:SKIRK_OAUTH_CLIENT_ID) {
+              throw "SKIRK_OAUTH_CLIENT_ID must be set when SKIRK_OAUTH_CLIENT_SECRET is set"
+            }
+            $ldflags = "$ldflags -X main.defaultOAuthClientID=$env:SKIRK_OAUTH_CLIENT_ID -X main.defaultOAuthClientSecret=$env:SKIRK_OAUTH_CLIENT_SECRET"
+          }
+          go build -trimpath -ldflags "$ldflags" -o clients/desktop/src-tauri/resources/sidecars/windows/skirk-sidecar.exe ./cmd/skirk
+
+      - name: Stage Windows VPN sidecar
+        shell: pwsh
+        run: |
+          $version = "1.13.12"
+          $expectedSha256 = "e93fc531134eb1beb4efa3c74990a24e48456098a31c03b60d5ddf17f223cf98"
+          $zip = "$env:RUNNER_TEMP\sing-box-$version-windows-amd64.zip"
+          $url = "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-windows-amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actualSha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "sing-box checksum mismatch: expected $expectedSha256 got $actualSha256"
+          }
+          $extract = "$env:RUNNER_TEMP\sing-box"
+          New-Item -ItemType Directory -Force $extract | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $exe = Get-ChildItem -Path $extract -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw "sing-box.exe was not found in $zip"
+          }
+          Copy-Item $exe.FullName clients/desktop/src-tauri/resources/sidecars/windows/skirk-tunnel.exe -Force
+          $license = Get-ChildItem -Path $extract -Recurse -Filter "LICENSE*" | Select-Object -First 1
+          if (-not $license) {
+            throw "sing-box license was not found in $zip"
+          }
+          Copy-Item $license.FullName clients/desktop/src-tauri/resources/sidecars/windows/sing-box-LICENSE.txt -Force
+
+      - name: Build Tauri desktop app
+        working-directory: clients/desktop
+        run: |
+          npm ci
+          npm run tauri build -- --no-bundle
+
+      - name: Build portable zip
+        run: python clients/desktop/scripts/package_windows_portable.py
+
+      - name: Prepare Windows release checksums
+        shell: pwsh
+        run: |
+          $zip = "dist/windows-portable/Skirk_windows_x64_portable.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $zip -Leaf)" | Set-Content "$zip.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-desktop-release
+          path: |
+            dist/windows-portable/Skirk_windows_x64_portable.zip
+            dist/windows-portable/Skirk_windows_x64_portable.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - release
+      - android
+      - windows-desktop
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p dist-release
+          gh run download "${GITHUB_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --dir dist-release \
+            --name cli-release \
+            --name android-release \
+            --name windows-desktop-release
+          find dist-release -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do
+            mv "$file" "dist-release/$(basename "$file")"
+          done
+          find dist-release -mindepth 1 -type d -empty -delete
+
+      - name: Generate artifact checksums
+        run: |
+          (cd dist-release && find . -type f ! -name 'SHA256SUMS' ! -name '*.sha256' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+
+      - name: Generate artifact provenance attestations
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist-release/skirk-android-arm64.apk
+            dist-release/skirk-linux-amd64.tar.gz
+            dist-release/skirk-linux-arm64.tar.gz
+            dist-release/skirk-windows-amd64.zip
+            dist-release/Skirk_windows_x64_portable.zip
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -t assets < <(find dist-release -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no release assets found" >&2
+            exit 1
+          fi
+          stale_android_asset="skirk-${GITHUB_REF_NAME}-android-arm64.apk"
+          stale_android_checksum="${stale_android_asset}.sha256"
+          release_notes=$'Assets:\n- Skirk_windows_x64_portable.zip: Windows GUI portable app with proxy, system proxy, and VPN modes. Extract it and open Skirk.exe.\n- skirk-windows-amd64.zip: Windows CLI-only build for PowerShell/manual use.\n- skirk-android-arm64.apk: release-signed Android arm64 APK for sideloading.\n\nIntegrity:\n- SHA256SUMS covers the published archives/APK.\n- GitHub artifact attestations are generated for the APK and archives; verify with `gh attestation verify <asset> -R '"${GITHUB_REPOSITORY}"$'`.\n'
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            existing_assets="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+            for stale in "${stale_android_asset}" "${stale_android_checksum}"; do
+              if grep -Fxq "${stale}" <<<"${existing_assets}"; then
+                gh release delete-asset "${GITHUB_REF_NAME}" "${stale}" -y
+              fi
+            done
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+            gh release edit "${GITHUB_REF_NAME}" --notes "$release_notes"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --title "${GITHUB_REF_NAME}" --generate-notes --notes "$release_notes"
+          fi
+          published_assets="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+          for asset in ${published_assets}; do
+            case "${asset}" in
+              skirk-v*-android-arm64.apk|skirk-v*-android-arm64.apk.sha256)
+                echo "stale versioned Android asset remains: ${asset}" >&2
+                exit 1
+                ;;
+            esac
+          done

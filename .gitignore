@@ -1,0 +1,55 @@
+# Local/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Secrets and generated configs
+.env
+.env.*
+!.env.example
+application_default_credentials.json
+private/
+skirk.json
+skirk-kit/
+skirk-config/
+client.json
+exit.json
+*.skirk
+*.secret
+*.token
+*.pem
+*.key
+*.jks
+*.keystore
+*.p12
+*.pfx
+google-services.json
+oauth-client.json
+
+# Probe/build artifacts
+.skirk-runs/
+probe_results/
+cloud_resources/
+
+# Bundled research inputs are kept locally but not committed to the Skirk code repo.
+sources/
+zips/
+skirk_research_bundle/
+skirk_research_bundle.zip
+
+# Go build outputs
+/bin/
+/dist/
+clients/desktop/node_modules/
+clients/desktop/dist/
+clients/desktop/src-tauri/target/
+clients/desktop/src-tauri/resources/sidecars/
+clients/desktop/src-tauri/gen/
+clients/android/local.properties
+clients/android/.gradle/
+clients/android/.kotlin/
+clients/android/app/build/
+third_party/hev-socks5-tunnel/libs/
+third_party/hev-socks5-tunnel/obj/
+coverage.out
