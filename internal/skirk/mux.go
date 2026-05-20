@@ -68,6 +68,7 @@ const (
 	muxUploadPriorityBurst       = 4
 	muxUploadIDPoolSize          = 64
 	muxPriorityDownloadHedge     = 1500 * time.Millisecond
+	muxNormalDownloadHedge       = 400 * time.Millisecond
 	muxNormalActivePollInterval  = 2 * time.Second
 	muxNormalActivePollMin       = 500 * time.Millisecond
 	muxReceiveGapRepairInterval  = 2 * time.Second
@@ -3468,9 +3469,26 @@ func (m *driveMux) processMuxObject(ctx context.Context, meta muxObjectMeta) err
 }
 
 func (m *driveMux) downloadMuxObject(ctx context.Context, meta muxObjectMeta) ([]byte, error) {
-	if !meta.Priority {
-		return m.downloadMuxObjectOnce(ctx, meta)
+	// Priority traffic carries an aggressive hedge because head-of-line
+	// blocking on priority data is the worst failure mode for the mux.
+	// Normal traffic gets a shorter hedge so a single slow Drive request
+	// no longer holds up the entire receive pipeline -- but the limiter's
+	// CanHedge() guard inside the hedged path will suppress the extra
+	// request when the adaptive limiter is already saturated, so quota
+	// burn is bounded.
+	hedgeDelay := muxNormalDownloadHedge
+	if meta.Priority {
+		hedgeDelay = muxPriorityDownloadHedge
 	}
+	return m.downloadMuxObjectHedged(ctx, meta, hedgeDelay)
+}
+
+// downloadMuxObjectHedged issues a primary attempt and, after hedgeDelay,
+// fires a second attempt while both still race -- but only if the adaptive
+// download limiter reports spare capacity via canHedgeDownload. Whichever
+// returns data first wins; the losing attempt is cancelled so the limiter
+// is not trained on its (now-redundant) result.
+func (m *driveMux) downloadMuxObjectHedged(ctx context.Context, meta muxObjectMeta, hedgeDelay time.Duration) ([]byte, error) {
 	hedgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var won atomic.Bool
@@ -3489,7 +3507,7 @@ func (m *driveMux) downloadMuxObject(ctx context.Context, meta muxObjectMeta) ([
 	completed := 0
 	var firstErr error
 	startAttempt()
-	timer := time.NewTimer(muxPriorityDownloadHedge)
+	timer := time.NewTimer(hedgeDelay)
 	defer timer.Stop()
 	for completed < attempts {
 		select {
@@ -3521,7 +3539,7 @@ func (m *driveMux) downloadMuxObject(ctx context.Context, meta muxObjectMeta) ([
 		}
 	}
 	if firstErr == nil {
-		firstErr = errors.New("priority mux download failed")
+		firstErr = errors.New("mux download failed")
 	}
 	return nil, firstErr
 }

@@ -1,10 +1,13 @@
 package skirk
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNewMailboxPoolRejectsNilPrimary(t *testing.T) {
@@ -341,4 +344,117 @@ func TestConfigValidatesExtraMailboxes(t *testing.T) {
 			t.Fatalf("unexpected validate error at limit: %v", err)
 		}
 	})
+}
+
+// --- Parallel ListFresh tests -------------------------------------------
+
+// TestParallelListFresh verifies that fanOutListFresh runs the per-mailbox
+// callbacks in parallel: when one mailbox is artificially slow, total wall
+// clock should be bounded by the slowest call (~max) rather than the sum
+// of all calls.
+//
+// We also verify that:
+//   - all results are returned (no goroutines drop their work),
+//   - results come back in mailbox-index order (so the downstream
+//     duplicate-detection / recordID semantics in ListFresh are preserved).
+func TestParallelListFresh(t *testing.T) {
+	// Build a pool with 4 mailboxes. The underlying *DriveStore values are
+	// never invoked because fanOutListFresh delegates the work to the
+	// callback we pass in, so empty stubs are fine.
+	pool, err := NewMailboxPool(&DriveStore{}, &DriveStore{}, &DriveStore{}, &DriveStore{})
+	if err != nil {
+		t.Fatalf("NewMailboxPool: %v", err)
+	}
+
+	// Per-mailbox sleeps. mailbox 1 is the "slow" one at 200ms; the others
+	// are effectively immediate. Sequential execution would take ~280ms;
+	// parallel execution should be ~200ms.
+	delays := []time.Duration{
+		20 * time.Millisecond,
+		200 * time.Millisecond,
+		30 * time.Millisecond,
+		30 * time.Millisecond,
+	}
+
+	var invocations atomic.Int32
+
+	start := time.Now()
+	parts := pool.fanOutListFresh(context.Background(), func(ctx context.Context, idx int, _ *DriveStore) listFreshResult {
+		invocations.Add(1)
+		select {
+		case <-time.After(delays[idx]):
+		case <-ctx.Done():
+			return listFreshResult{err: ctx.Err()}
+		}
+		return listFreshResult{
+			objects: []ObjectInfo{{ID: fmt.Sprintf("id-%d", idx), Name: fmt.Sprintf("name-%d", idx)}},
+		}
+	})
+	elapsed := time.Since(start)
+
+	if got, want := invocations.Load(), int32(4); got != want {
+		t.Fatalf("invocations = %d, want %d (one per mailbox)", got, want)
+	}
+
+	// Sum of sleeps is 280ms; parallel max is 200ms. Allow generous slack
+	// for goroutine scheduling on busy CI runners but still firmly below
+	// the sequential sum.
+	if elapsed >= 280*time.Millisecond {
+		t.Fatalf("fanOutListFresh took %s, expected closer to max(%s)=200ms (sequential sum would be 280ms)", elapsed, delays[1])
+	}
+	// And it must obviously not have finished before the slowest mailbox.
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("fanOutListFresh returned in %s, suspiciously faster than the slowest mailbox (%s)", elapsed, delays[1])
+	}
+
+	// Results must come back in mailbox-index order. This is the property
+	// that lets ListFresh keep its "first mailbox that saw this ID wins"
+	// semantics intact.
+	if got, want := len(parts), 4; got != want {
+		t.Fatalf("len(parts) = %d, want %d", got, want)
+	}
+	for i, r := range parts {
+		if r.idx != i {
+			t.Errorf("parts[%d].idx = %d, want %d", i, r.idx, i)
+		}
+		if r.err != nil {
+			t.Errorf("parts[%d].err = %v, want nil", i, r.err)
+		}
+		if len(r.objects) != 1 || r.objects[0].ID != fmt.Sprintf("id-%d", i) {
+			t.Errorf("parts[%d].objects = %+v, want [id-%d]", i, r.objects, i)
+		}
+	}
+}
+
+// TestParallelListFreshPropagatesPerMailboxError verifies that a failure
+// from one mailbox does not abort the fan-out: the other mailboxes still
+// return their data, and the error is preserved in its slot.
+func TestParallelListFreshPropagatesPerMailboxError(t *testing.T) {
+	pool, err := NewMailboxPool(&DriveStore{}, &DriveStore{}, &DriveStore{})
+	if err != nil {
+		t.Fatalf("NewMailboxPool: %v", err)
+	}
+
+	boom := errors.New("mailbox 1 exploded")
+	parts := pool.fanOutListFresh(context.Background(), func(ctx context.Context, idx int, _ *DriveStore) listFreshResult {
+		if idx == 1 {
+			return listFreshResult{err: boom}
+		}
+		return listFreshResult{
+			objects: []ObjectInfo{{ID: fmt.Sprintf("id-%d", idx)}},
+		}
+	})
+
+	if len(parts) != 3 {
+		t.Fatalf("len(parts) = %d, want 3", len(parts))
+	}
+	if parts[0].err != nil || len(parts[0].objects) != 1 {
+		t.Errorf("parts[0] = %+v, want one object and no error", parts[0])
+	}
+	if !errors.Is(parts[1].err, boom) {
+		t.Errorf("parts[1].err = %v, want %v", parts[1].err, boom)
+	}
+	if parts[2].err != nil || len(parts[2].objects) != 1 {
+		t.Errorf("parts[2] = %+v, want one object and no error", parts[2])
+	}
 }
