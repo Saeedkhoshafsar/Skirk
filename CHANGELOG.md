@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.1.56 - 2026-05-20
+
+### Hedge routes around a stuck mailbox; per-mailbox latency is observable
+
+This release also retroactively documents the v0.1.55-cycle work that
+landed in PR #7 ("parallel mailbox list + normal-traffic download
+hedge") but missed its own CHANGELOG entry:
+
+- **`MailboxPool.ListFresh*` runs in parallel.** `ListFresh`,
+  `ListFreshStatus`, and `ListFreshContainsPageStatus` now fan out
+  across mailboxes via a shared `fanOutListFresh` helper instead of
+  walking them sequentially, so total wall-clock latency tracks the
+  slowest mailbox rather than the sum of all mailboxes. Result order
+  is preserved (`first mailbox that saw this ID wins` for duplicate
+  detection); per-mailbox errors no longer abort the fan-out.
+- **Normal (non-priority) mux downloads now hedge** at
+  `muxNormalDownloadHedge` (~400ms), guarded by the adaptive
+  `canHedgeDownload` limiter so quota burn is bounded. A single slow
+  Drive response no longer holds up the receive pipeline until the gap
+  repair machinery kicks in.
+
+On top of that PR #7 work, v0.1.56 fixes the bug it left behind:
+
+- **Hedged download attempts now skip the primary mailbox** on
+  multi-mailbox pools. Previously the mux fired a second `GetByID` after
+  `muxNormalDownloadHedge` / `muxPriorityDownloadHedge`, but both
+  attempts resolved the fileID through the pool's deterministic
+  `storeForID` map and therefore landed on the *same* `DriveStore`.
+  Against a mailbox that was itself slow (per-account throttle, adaptive
+  backoff, hung HTTP request), the hedge could not help. A new
+  `mailboxHedgeStore` optional interface (`PeekMailboxForID` +
+  `GetByIDExcluding`) lets the mux route the second attempt to a
+  *different* mailbox; on a single-mailbox pool or before any
+  fileID→mailbox mapping has been recorded the call degrades cleanly to
+  the previous plain `GetByID` semantics, so the regression surface is
+  bounded to multi-mailbox pools at steady state.
+- **Per-mailbox latency is logged when one mailbox drags the fan-out.**
+  `listFreshResult` now carries a `duration` field that
+  `fanOutListFresh` records around every callback, and `MailboxPool`
+  emits a single `slow <op> mailbox[i] duration=...` line per mailbox
+  that crosses `slowMailboxListThreshold` (500ms, var so tests can
+  lower it). Quiet in steady state; loud the moment one mailbox is
+  consistently the slowest of the fan-out. `ListFresh`,
+  `ListFreshStatus`, and `ListFreshContainsPageStatus` all opt in so
+  the three FreshList* surfaces share the same observability.
+- Six new unit tests cover the new behaviour:
+  - `TestMuxHedgeAttemptRoutesToDifferentMailbox` is the regression for
+    the hedge-routing fix: a stub `mailboxHedgeStore` whose primary
+    mailbox blocks forever and whose hedge mailbox returns immediately
+    must produce the hedge response within the hedge delay window.
+  - `TestMuxHedgeFallsBackToPlainGetByIDWithoutMapping` pins the
+    "no mapping yet" case so the very first download for a fileID does
+    not skip every mailbox.
+  - `TestPeekMailboxForIDReportsRecordedIndex` /
+    `…SingleMailboxReturnsMinusOne` / `…NilReceiver` pin the snapshot
+    contract that the mux relies on.
+  - `TestFanOutListFreshRecordsDuration` and
+    `TestLogSlowMailboxesQuietBelowThreshold` /
+    `…EmitsOnePerSlowMailbox` cover the latency tracking and the
+    quiet-vs-loud thresholding.
+
+The download hot path is unchanged for single-mailbox deployments. On
+multi-mailbox pools, the hedge now actually does what the v0.1.55 commit
+message said it did.
+
 ## v0.1.55 - 2026-05-20
 
 ### `skirk mailbox` CLI for managing multi-mailbox kits

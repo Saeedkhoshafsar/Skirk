@@ -2223,6 +2223,179 @@ func (s *slowFirstObjectStore) GetByID(ctx context.Context, _ string) ([]byte, e
 
 func (s *slowFirstObjectStore) DeleteID(context.Context, string) error { return nil }
 
+// hedgeRoutingStore models a multi-mailbox pool for the express purpose of
+// verifying that downloadMuxObjectHedged sends the second (hedged) attempt
+// to a *different* mailbox than the primary. The primary mailbox blocks
+// forever (simulating a stuck/throttled mailbox); the hedge mailbox
+// returns immediately. If the hedge wrongly hit the primary mailbox, the
+// test would time out.
+//
+// We implement mailboxHedgeStore so the mux can call PeekMailboxForID and
+// GetByIDExcluding; ObjectIDStore.GetByID is also implemented because the
+// non-hedge attempt path falls back to it.
+type hedgeRoutingStore struct {
+	// primaryIdx is the mailbox PeekMailboxForID will return. The mux is
+	// expected to ask GetByIDExcluding(_, _, primaryIdx) on the hedge.
+	primaryIdx int
+	// primaryCalls counts how many times the primary mailbox was hit.
+	// The test asserts exactly one (the first attempt).
+	primaryCalls atomic.Int32
+	// hedgeCalls counts how many times the hedge mailbox was hit. The
+	// test asserts >= 1 (and that the response came from there).
+	hedgeCalls atomic.Int32
+	// primaryExited is closed when the primary attempt returns, so the
+	// test can wait for the loser to unwind before checking limiter state.
+	primaryExited chan struct{}
+}
+
+func (s *hedgeRoutingStore) Put(context.Context, string, []byte) error { return nil }
+func (s *hedgeRoutingStore) Get(ctx context.Context, name string) ([]byte, error) {
+	return s.GetByID(ctx, name)
+}
+func (s *hedgeRoutingStore) List(context.Context, string) ([]ObjectInfo, error) {
+	return nil, nil
+}
+func (s *hedgeRoutingStore) Delete(context.Context, string) error   { return nil }
+func (s *hedgeRoutingStore) DeleteID(context.Context, string) error { return nil }
+func (s *hedgeRoutingStore) PeekMailboxForID(string) int            { return s.primaryIdx }
+
+// GetByID models the primary mailbox: it blocks until the context fires.
+// Without an excludeMailbox hint, the mux would route here for *both*
+// attempts in a regular MailboxPool -- which is exactly the bug we are
+// fixing.
+func (s *hedgeRoutingStore) GetByID(ctx context.Context, _ string) ([]byte, error) {
+	s.primaryCalls.Add(1)
+	defer close(s.primaryExited)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// GetByIDExcluding models the hedge mailbox: it must be invoked with
+// excludeMailbox == s.primaryIdx and returns immediately. If the mux
+// passed the wrong excludeMailbox, this method records the discrepancy on
+// a side channel and we still return success (the test asserts the
+// discrepancy is zero).
+func (s *hedgeRoutingStore) GetByIDExcluding(_ context.Context, _ string, excludeMailbox int) ([]byte, error) {
+	s.hedgeCalls.Add(1)
+	if excludeMailbox != s.primaryIdx {
+		return nil, fmt.Errorf("hedge routed with excludeMailbox=%d, want %d", excludeMailbox, s.primaryIdx)
+	}
+	return []byte("hedge-mailbox"), nil
+}
+
+// TestMuxHedgeAttemptRoutesToDifferentMailbox is the regression test for
+// the mailbox-pool hedge fix. In a multi-mailbox pool, the fileID→mailbox
+// map is deterministic, so without explicit routing the primary and the
+// hedge would both hit the same DriveStore. A mailbox that is itself
+// stuck (e.g. hitting per-account quota) would slow down both attempts
+// identically and the hedge would be useless.
+//
+// This test models that exact failure: the "primary" mailbox blocks
+// forever, the "hedge" mailbox returns immediately, and we assert that
+// the call returns the hedge bytes within the hedge delay window.
+func TestMuxHedgeAttemptRoutesToDifferentMailbox(t *testing.T) {
+	store := &hedgeRoutingStore{primaryIdx: 1, primaryExited: make(chan struct{})}
+	tunnel := &Tunnel{
+		Data:                store,
+		DownloadConcurrency: 8,
+		Profile:             "auto",
+		role:                "client",
+	}
+	mux := &driveMux{t: tunnel}
+
+	started := time.Now()
+	sealed, err := mux.downloadMuxObject(context.Background(), muxObjectMeta{Name: "obj", ID: "file-id", Priority: true})
+	if err != nil {
+		t.Fatalf("download mux object: %v", err)
+	}
+	if string(sealed) != "hedge-mailbox" {
+		t.Fatalf("sealed = %q, want hedge-mailbox response (hedge must land on the non-primary mailbox)", sealed)
+	}
+	if elapsed := time.Since(started); elapsed >= 3*time.Second {
+		t.Fatalf("hedged download took %s, want fast hedge to a different mailbox", elapsed)
+	}
+	if got := store.hedgeCalls.Load(); got < 1 {
+		t.Fatalf("hedge mailbox calls = %d, want >= 1 (hedge never landed on the non-primary mailbox)", got)
+	}
+	if got := store.primaryCalls.Load(); got != 1 {
+		t.Fatalf("primary mailbox calls = %d, want exactly 1 (only the first attempt should hit it)", got)
+	}
+
+	select {
+	case <-store.primaryExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary attempt did not exit after the hedge winner canceled the race")
+	}
+}
+
+// hedgeRoutingStoreNoMapping models the first-download case where the
+// pool has not yet recorded a fileID→mailbox mapping (so
+// PeekMailboxForID returns -1). The hedge must then fall back to plain
+// GetByID semantics rather than refusing to issue any request at all.
+type hedgeRoutingStoreNoMapping struct {
+	calls       atomic.Int32
+	firstExited chan struct{}
+}
+
+func (s *hedgeRoutingStoreNoMapping) Put(context.Context, string, []byte) error { return nil }
+func (s *hedgeRoutingStoreNoMapping) Get(ctx context.Context, name string) ([]byte, error) {
+	return s.GetByID(ctx, name)
+}
+func (s *hedgeRoutingStoreNoMapping) List(context.Context, string) ([]ObjectInfo, error) {
+	return nil, nil
+}
+func (s *hedgeRoutingStoreNoMapping) Delete(context.Context, string) error   { return nil }
+func (s *hedgeRoutingStoreNoMapping) DeleteID(context.Context, string) error { return nil }
+func (s *hedgeRoutingStoreNoMapping) PeekMailboxForID(string) int            { return -1 }
+func (s *hedgeRoutingStoreNoMapping) GetByID(ctx context.Context, _ string) ([]byte, error) {
+	if s.calls.Add(1) == 1 {
+		defer close(s.firstExited)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []byte("hedged-no-map"), nil
+}
+
+// GetByIDExcluding must not be called when PeekMailboxForID returns -1.
+// If it is, the test fails with an obvious error.
+func (s *hedgeRoutingStoreNoMapping) GetByIDExcluding(context.Context, string, int) ([]byte, error) {
+	s.calls.Add(1) // poison the count so the test below sees the mistake
+	return nil, errors.New("hedge wrongly routed to GetByIDExcluding when no mapping was recorded")
+}
+
+// TestMuxHedgeFallsBackToPlainGetByIDWithoutMapping pins the contract for
+// the "no mapping yet" case: PeekMailboxForID returns -1 (which is what
+// MailboxPool does before the first successful download has recorded the
+// fileID→mailbox mapping), and the hedge attempt must take the plain
+// GetByID path -- otherwise the very first download for a given fileID
+// would skip every mailbox and fail immediately.
+func TestMuxHedgeFallsBackToPlainGetByIDWithoutMapping(t *testing.T) {
+	store := &hedgeRoutingStoreNoMapping{firstExited: make(chan struct{})}
+	tunnel := &Tunnel{
+		Data:                store,
+		DownloadConcurrency: 8,
+		Profile:             "auto",
+		role:                "client",
+	}
+	mux := &driveMux{t: tunnel}
+
+	sealed, err := mux.downloadMuxObject(context.Background(), muxObjectMeta{Name: "obj", ID: "file-id", Priority: true})
+	if err != nil {
+		t.Fatalf("download mux object: %v", err)
+	}
+	if string(sealed) != "hedged-no-map" {
+		t.Fatalf("sealed = %q, want hedged-no-map (hedge should fall back to GetByID when no mapping is known)", sealed)
+	}
+	if got := store.calls.Load(); got < 2 {
+		t.Fatalf("store calls = %d, want >= 2 (primary + hedge fallback through GetByID)", got)
+	}
+	select {
+	case <-store.firstExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary attempt did not exit after the hedge took over")
+	}
+}
+
 func TestMuxFramesStayOnHomeLane(t *testing.T) {
 	mux := &driveMux{lanes: make([]*muxLane, muxLaneCount)}
 	first := muxFrame{Kind: muxFrameData, StreamID: 9, Seq: 1, Payload: []byte("small")}

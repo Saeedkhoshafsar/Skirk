@@ -316,6 +316,27 @@ type driveQuotaWaitStore interface {
 	WaitForDriveQuota(ctx context.Context, op string) error
 }
 
+// mailboxHedgeStore is an optional interface implemented by stores that can
+// distinguish between their backing mailboxes. The mux uses it when issuing
+// a hedged second download attempt so the hedge lands on a different
+// mailbox from the primary -- without it, both attempts go through the same
+// fileID→mailbox mapping (see MailboxPool.storeForID) and the hedge cannot
+// route around a slow or throttled mailbox.
+//
+// PeekMailboxForID is a non-blocking lookup that returns the mailbox the
+// primary attempt is expected to target (or -1 if no mapping is recorded
+// yet, in which case there is no need to exclude anything because the
+// primary will itself fan out across mailboxes).
+//
+// GetByIDExcluding fetches the object while deliberately skipping the
+// given mailbox index. On a single-mailbox pool it degenerates to plain
+// GetByID semantics (excludeMailbox is treated as a hint, not a hard
+// requirement) so that callers do not have to special-case pool size.
+type mailboxHedgeStore interface {
+	PeekMailboxForID(fileID string) int
+	GetByIDExcluding(ctx context.Context, fileID string, excludeMailbox int) ([]byte, error)
+}
+
 type muxPreparedUpload struct {
 	frames   []muxFrame
 	priority bool
@@ -3488,6 +3509,15 @@ func (m *driveMux) downloadMuxObject(ctx context.Context, meta muxObjectMeta) ([
 // download limiter reports spare capacity via canHedgeDownload. Whichever
 // returns data first wins; the losing attempt is cancelled so the limiter
 // is not trained on its (now-redundant) result.
+//
+// When the backing store is a multi-mailbox pool, the hedge attempt is
+// deliberately routed to a *different* mailbox from the primary (see
+// mailboxHedgeStore). The pool's fileID→mailbox map is deterministic, so
+// without this both attempts would land on the same DriveStore and the
+// hedge would be useless against a mailbox that is itself slow or
+// throttled. The single-mailbox path is unchanged: both attempts go
+// through the regular store, which is still useful for masking a single
+// stuck HTTP request.
 func (m *driveMux) downloadMuxObjectHedged(ctx context.Context, meta muxObjectMeta, hedgeDelay time.Duration) ([]byte, error) {
 	hedgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -3497,16 +3527,16 @@ func (m *driveMux) downloadMuxObjectHedged(ctx context.Context, meta muxObjectMe
 		err    error
 	}
 	results := make(chan result, 2)
-	startAttempt := func() {
+	startAttempt := func(hedge bool) {
 		go func() {
-			sealed, err := m.downloadMuxObjectAttempt(hedgeCtx, meta, &won)
+			sealed, err := m.downloadMuxObjectAttempt(hedgeCtx, meta, &won, hedge)
 			results <- result{sealed: sealed, err: err}
 		}()
 	}
 	attempts := 1
 	completed := 0
 	var firstErr error
-	startAttempt()
+	startAttempt(false)
 	timer := time.NewTimer(hedgeDelay)
 	defer timer.Stop()
 	for completed < attempts {
@@ -3527,12 +3557,12 @@ func (m *driveMux) downloadMuxObjectHedged(ctx context.Context, meta muxObjectMe
 			}
 			if attempts == 1 {
 				attempts++
-				startAttempt()
+				startAttempt(true)
 			}
 		case <-timer.C:
 			if attempts == 1 && m.t.canHedgeDownload() {
 				attempts++
-				startAttempt()
+				startAttempt(true)
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -3545,10 +3575,17 @@ func (m *driveMux) downloadMuxObjectHedged(ctx context.Context, meta muxObjectMe
 }
 
 func (m *driveMux) downloadMuxObjectOnce(ctx context.Context, meta muxObjectMeta) ([]byte, error) {
-	return m.downloadMuxObjectAttempt(ctx, meta, nil)
+	return m.downloadMuxObjectAttempt(ctx, meta, nil, false)
 }
 
-func (m *driveMux) downloadMuxObjectAttempt(ctx context.Context, meta muxObjectMeta, hedgeWon *atomic.Bool) ([]byte, error) {
+// downloadMuxObjectAttempt issues a single download. When hedge is true and
+// the backing store implements mailboxHedgeStore, the attempt is routed to
+// a different mailbox than the one the primary attempt would (or did)
+// target -- otherwise both the primary and the hedge would resolve to the
+// same DriveStore via the pool's deterministic fileID→mailbox map. On a
+// single-mailbox pool, or when the store does not expose the hedge hooks,
+// hedge=true degrades cleanly to the same call as hedge=false.
+func (m *driveMux) downloadMuxObjectAttempt(ctx context.Context, meta muxObjectMeta, hedgeWon *atomic.Bool, hedge bool) ([]byte, error) {
 	if store, ok := m.t.Data.(driveQuotaWaitStore); ok {
 		if err := store.WaitForDriveQuota(ctx, "mux_download"); err != nil {
 			return nil, err
@@ -3564,10 +3601,28 @@ func (m *driveMux) downloadMuxObjectAttempt(ctx context.Context, meta muxObjectM
 	opCtx, cancel := context.WithTimeout(ctx, muxDriveAttemptTimeout(meta.normalReceiveBytes(), meta.Priority, m.t.RouteProxy != ""))
 	var sealed []byte
 	if meta.ID != "" {
-		if store, ok := m.t.Data.(ObjectIDStore); ok {
-			sealed, err = store.GetByID(opCtx, meta.ID)
-		} else {
-			sealed, err = m.t.Data.Get(opCtx, meta.Name)
+		// Try to land the hedge on a *different* mailbox from the primary.
+		// PeekMailboxForID is a cheap snapshot of the pool's fileID→mailbox
+		// map and returns -1 when nothing useful is known (single-mailbox
+		// pool, or no mapping yet) -- in which case we fall through to the
+		// regular GetByID path so the hedge still races a fresh request
+		// even if it cannot pick a different mailbox.
+		routed := false
+		if hedge {
+			if hedgeStore, ok := m.t.Data.(mailboxHedgeStore); ok {
+				primaryIdx := hedgeStore.PeekMailboxForID(meta.ID)
+				if primaryIdx >= 0 {
+					sealed, err = hedgeStore.GetByIDExcluding(opCtx, meta.ID, primaryIdx)
+					routed = true
+				}
+			}
+		}
+		if !routed {
+			if store, ok := m.t.Data.(ObjectIDStore); ok {
+				sealed, err = store.GetByID(opCtx, meta.ID)
+			} else {
+				sealed, err = m.t.Data.Get(opCtx, meta.Name)
+			}
 		}
 	} else {
 		sealed, err = m.t.Data.Get(opCtx, meta.Name)
