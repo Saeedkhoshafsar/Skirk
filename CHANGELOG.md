@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.1.55 - 2026-05-20
+
+### `skirk mailbox` CLI for managing multi-mailbox kits
+
+- **New top-level command `skirk mailbox`** with five subcommands that
+  replace the previous hand-edit-JSON-then-regenerate-client.skirk workflow
+  for growing or shrinking the Drive mailbox pool:
+  - `mailbox list` shows every mailbox in a kit and labels which one is
+    `primary` vs `extra`. Supports `--json` for scripting.
+  - `mailbox add` runs the Google OAuth login for a fresh Google account,
+    provisions a Drive mailbox folder for it, appends it to
+    `drive.extra_mailboxes` in both `exit.json` and `client.json`,
+    regenerates `client.skirk` and `client-command.txt`, and restarts the
+    exit service on Linux. Supports `--oauth-mode easy|personal` and
+    `--label NAME` (with auto-generated `alt1`/`alt2`/... if omitted).
+  - `mailbox remove` deletes an extra mailbox by `--label` or
+    1-based `--index` and re-syncs the client side. Refuses to remove the
+    primary mailbox and warns that lane reordering invalidates old
+    `client.skirk` profiles.
+  - `mailbox promote` swaps an extra with the primary so the extra
+    becomes the new top-level Auth/Drive pair while the old primary takes
+    its slot. Lane order is preserved exactly so no mid-flight stream is
+    misrouted.
+  - `mailbox regenerate-client` rebuilds `client.skirk` and
+    `client-command.txt` from `client.json` after manual edits.
+- The operator menu (`skirk` with no arguments) gains a new entry
+  "Manage Drive mailboxes (add, remove, list)" that wraps the same flows
+  with a wizard-style prompt. Existing menu items are renumbered.
+- Refuses to add a Google account that is already configured as the
+  primary or any extra mailbox (matching `refresh_token`), since striping
+  across the same OAuth principal does not unlock new Drive API quota
+  and just complicates operator debugging.
+- Mailbox labels are validated up-front (3–96 chars, letters/digits/`_-.`)
+  so they pass `Config.Validate()` and remain safe to embed in Drive
+  object names. Auto-generated labels follow the existing
+  `alt1`/`alt2`/`alt3` convention from the README example.
+- Eleven new unit tests cover the label resolver, the index/label
+  argument resolver, primary/extra duplicate detection, the
+  `--json` listing path, the remove-by-label happy path with
+  client.skirk round-trip verification, the empty-extras refusal, the
+  promote swap invariant, the regenerate-client recovery flow, and the
+  no-op behavior when a kit has only an `exit.json`.
+
+This is an operator-experience release: existing kits keep working
+unchanged, the runtime hot path is untouched, and the new subcommands
+fail closed (no JSON is rewritten if any sanity check rejects the
+proposed kit).
+
 ## v0.1.54 - 2026-05-19
 
 ### Multi-mailbox striping reaches end users

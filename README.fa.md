@@ -247,6 +247,40 @@ deterministic است (هش FNV-1a روی نام object به‌علاوه‌ی po
 exit بدون مذاکره به یک mailbox برسند. حذف `extra_mailboxes` رفتار را
 byte-for-byte به حالت تک‌mailbox قبلی برمی‌گرداند.
 
+#### مدیریت mailboxها با CLI (بدون ویرایش دستی JSON)
+
+برای اضافه/حذف کردن mailbox دیگر نیازی نیست `exit.json` و `client.json` را
+دستی ویرایش کنید، Python اجرا کنید، یا `client.skirk` را با دست تولید کنید.
+دستور `skirk mailbox` همه‌ی این مراحل را یکجا انجام می‌دهد:
+
+```bash
+# نمایش لیست تمام mailboxهای داخل کیت، با مشخص کردن primary و extraها.
+skirk mailbox list --kit skirk-kit
+
+# لاگین گوگل با یک اکانت جدید و اضافه کردن آن به‌عنوان mailbox اضافی.
+# به‌طور خودکار: exit.json را آپدیت می‌کند، client.json را در lockstep
+# آپدیت می‌کند، client.skirk را دوباره generate می‌کند، و در لینوکس سرویس
+# exit را restart می‌کند. اگر نمی‌خواهید restart شود از
+# --restart-exit=false استفاده کنید.
+skirk mailbox add --kit skirk-kit --oauth-mode personal --label alt2
+
+# حذف یک mailbox اضافی با label یا index یک‌مبنا.
+# پروفایل‌های client.skirk قدیمی بعد از این کار از کار می‌افتند، باید
+# client.skirk جدید را بین کلاینت‌ها پخش کنید.
+skirk mailbox remove --kit skirk-kit --label alt2
+
+# تبدیل یک mailbox اضافی به primary (mailbox primary قبلی به جای آن
+# extra می‌شود، پس ترتیب lane حفظ می‌ماند).
+skirk mailbox promote --kit skirk-kit --label alt1
+
+# اگر دستی client.json را ویرایش کردید، client.skirk را از روی آن دوباره
+# بسازید.
+skirk mailbox regenerate-client --kit skirk-kit
+```
+
+منوی tasvirgar Skirk (اجرای `skirk` بدون آرگومان) همین گزینه‌ها را زیر عنوان
+«Manage Drive mailboxes (add, remove, list)» در دسترس می‌گذارد.
+
 ## مستندات
 
 - [راهنمای نصب](docs/install.md)
