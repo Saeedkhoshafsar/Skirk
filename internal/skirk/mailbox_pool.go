@@ -285,9 +285,111 @@ func (p *MailboxPool) GetByID(ctx context.Context, fileID string) ([]byte, error
 	return p.fanOutGetByID(ctx, fileID)
 }
 
-func (p *MailboxPool) fanOutGetByID(ctx context.Context, fileID string) ([]byte, error) {
+// PeekMailboxForID reports the mailbox index that GetByID would currently
+// target for fileID, without issuing any RPC. The mux uses it to plan a
+// hedged download: if PeekMailboxForID returns idx >= 0, the second attempt
+// can be routed through GetByIDExcluding(..., idx) to avoid landing on the
+// same DriveStore as the primary.
+//
+// Returns -1 if no mapping is known yet (the primary attempt will fan out)
+// or on a single-mailbox pool (no useful "other mailbox" exists).
+func (p *MailboxPool) PeekMailboxForID(fileID string) int {
+	if p == nil || len(p.stores) <= 1 {
+		return -1
+	}
+	_, idx := p.storeForID(fileID)
+	return idx
+}
+
+// GetByIDPreferred is the same as GetByID, but also returns the mailbox
+// index that ultimately served the object. The mux uses the index to issue
+// a hedged second attempt against a different mailbox -- otherwise both the
+// primary and the hedge would hit the same DriveStore, defeating the whole
+// point of hedging in a multi-mailbox pool (a mailbox that is itself slow
+// or throttled would slow down both attempts identically).
+//
+// On a miss this falls back to the same fan-out as GetByID and reports the
+// index of whichever mailbox returned the data. On a single-mailbox pool it
+// degenerates to GetByID and returns index 0.
+func (p *MailboxPool) GetByIDPreferred(ctx context.Context, fileID string) ([]byte, int, error) {
 	if len(p.stores) == 1 {
-		return p.stores[0].GetByID(ctx, fileID)
+		data, err := p.stores[0].GetByID(ctx, fileID)
+		return data, 0, err
+	}
+	if store, idx := p.storeForID(fileID); store != nil {
+		data, err := store.GetByID(ctx, fileID)
+		if err == nil {
+			return data, idx, nil
+		}
+		if !isProbablyMailboxMiss(err) {
+			return data, idx, err
+		}
+		// Stale mapping: fall through to fan-out. The fan-out helper
+		// records the winning mailbox via recordID so subsequent reads
+		// (including the hedged second attempt) take the fast path.
+	}
+	data, idx, err := p.fanOutGetByIDWithIndex(ctx, fileID)
+	return data, idx, err
+}
+
+// GetByIDExcluding fetches fileID, deliberately skipping the mailbox at
+// excludeMailbox. The mux uses this for the second (hedged) download
+// attempt: if the primary mailbox is stuck or throttled, the hedge must go
+// somewhere else to do any good.
+//
+// Behaviour:
+//   - On a single-mailbox pool, or when excludeMailbox falls outside the
+//     valid range, this falls back to a plain GetByID (no useful "other
+//     mailbox" exists).
+//   - On a multi-mailbox pool, it tries every mailbox except excludeMailbox
+//     in parallel and returns whichever succeeds first.
+//   - If every non-excluded mailbox returns "not found" it falls back to
+//     the excluded mailbox as a last resort, so a stale primaryIdx hint
+//     does not silently turn a real object into a 404.
+func (p *MailboxPool) GetByIDExcluding(ctx context.Context, fileID string, excludeMailbox int) ([]byte, error) {
+	if len(p.stores) <= 1 || excludeMailbox < 0 || excludeMailbox >= len(p.stores) {
+		return p.GetByID(ctx, fileID)
+	}
+	data, _, err := p.fanOutGetByIDExcluding(ctx, fileID, excludeMailbox)
+	if err == nil {
+		return data, nil
+	}
+	// If every non-excluded mailbox missed, try the excluded one too so a
+	// wrong-looking hint does not mask a real object. This costs at most
+	// one extra request and only on the unhappy path.
+	if isProbablyMailboxMiss(err) {
+		data, getErr := p.stores[excludeMailbox].GetByID(ctx, fileID)
+		if getErr == nil {
+			p.recordID(fileID, excludeMailbox)
+			return data, nil
+		}
+	}
+	return nil, err
+}
+
+func (p *MailboxPool) fanOutGetByID(ctx context.Context, fileID string) ([]byte, error) {
+	data, _, err := p.fanOutGetByIDExcluding(ctx, fileID, -1)
+	return data, err
+}
+
+// fanOutGetByIDWithIndex is fanOutGetByID that also returns the index of
+// the mailbox that served the request. Used by GetByIDPreferred so the
+// caller can target a different mailbox on the hedged attempt.
+func (p *MailboxPool) fanOutGetByIDWithIndex(ctx context.Context, fileID string) ([]byte, int, error) {
+	return p.fanOutGetByIDExcluding(ctx, fileID, -1)
+}
+
+// fanOutGetByIDExcluding runs the parallel GetByID across every mailbox
+// except excludeIdx (pass -1 to include every mailbox). It is the shared
+// engine behind fanOutGetByID, fanOutGetByIDWithIndex, and
+// GetByIDExcluding so the cancellation/error-classification rules stay
+// identical across all three call sites.
+func (p *MailboxPool) fanOutGetByIDExcluding(ctx context.Context, fileID string, excludeIdx int) ([]byte, int, error) {
+	if len(p.stores) == 1 {
+		// excludeIdx is ignored on a single-mailbox pool by design --
+		// "skip the only mailbox" would just produce a fake 404.
+		data, err := p.stores[0].GetByID(ctx, fileID)
+		return data, 0, err
 	}
 	type result struct {
 		data []byte
@@ -298,7 +400,12 @@ func (p *MailboxPool) fanOutGetByID(ctx context.Context, fileID string) ([]byte,
 	fanCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
+	launched := 0
 	for i, s := range p.stores {
+		if i == excludeIdx {
+			continue
+		}
+		launched++
 		wg.Add(1)
 		go func(idx int, st *DriveStore) {
 			defer wg.Done()
@@ -313,11 +420,16 @@ func (p *MailboxPool) fanOutGetByID(ctx context.Context, fileID string) ([]byte,
 		wg.Wait()
 		close(out)
 	}()
+	if launched == 0 {
+		// Defensive: every mailbox was excluded. Surface a clear error
+		// rather than blocking on the empty channel.
+		return nil, -1, fmt.Errorf("object %s: no mailbox available (all excluded)", fileID)
+	}
 	var lastErr error
 	for r := range out {
 		if r.err == nil {
 			p.recordID(fileID, r.idx)
-			return r.data, nil
+			return r.data, r.idx, nil
 		}
 		if !isProbablyMailboxMiss(r.err) {
 			lastErr = r.err
@@ -326,7 +438,7 @@ func (p *MailboxPool) fanOutGetByID(ctx context.Context, fileID string) ([]byte,
 	if lastErr == nil {
 		lastErr = fmt.Errorf("object %s not found in any mailbox", fileID)
 	}
-	return nil, lastErr
+	return nil, -1, lastErr
 }
 
 func (p *MailboxPool) DeleteID(ctx context.Context, fileID string) error {
@@ -385,17 +497,34 @@ func (p *MailboxPool) GetObjectRangeByID(ctx context.Context, fileID string, sta
 
 // --- FreshListStore et al. ----------------------------------------------
 
+// slowMailboxListThreshold controls when fanOutListFresh emits a
+// per-mailbox latency warning. The fan-out itself returns as soon as the
+// slowest mailbox returns, but a chronically slow mailbox can drag every
+// FreshList* call up to its latency without showing up anywhere -- that
+// invisibility is exactly the bug per-mailbox timing logs solve. The
+// threshold is generous enough to ignore normal Drive jitter on a healthy
+// link but tight enough to catch a mailbox stuck in adaptive backoff or
+// hitting per-account throttles. It is a var (not const) so tests can lower
+// it without changing production behaviour.
+var slowMailboxListThreshold = 500 * time.Millisecond
+
 // listFreshResult holds one mailbox's slice of objects (or its error) along
 // with whatever paging metadata the caller asked for. We use the same struct
 // for plain ListFresh (which only needs Objects) and ListFreshStatus (which
 // also folds Pages/Truncated/Incomplete bits), so a single fan-out helper
 // can serve both call sites.
+//
+// duration is the wall-clock time the per-mailbox callback took; the
+// fan-out helper records it so the caller can log slow mailboxes without
+// having to wrap fn itself. A zero value means the helper did not measure
+// (older call sites that have not been migrated yet).
 type listFreshResult struct {
 	idx        int
 	objects    []ObjectInfo
 	pages      int
 	truncated  bool
 	incomplete bool
+	duration   time.Duration
 	err        error
 }
 
@@ -408,7 +537,8 @@ type listFreshResult struct {
 // Each goroutine receives its mailbox index and the underlying store; the
 // returned error is recorded per-mailbox (rather than aborting the fan-out)
 // so a single transient failure on one mailbox does not mask fresh data on
-// the others.
+// the others. The helper also measures each call's wall-clock duration so
+// callers can warn on a mailbox that is consistently dragging the fan-out.
 func (p *MailboxPool) fanOutListFresh(
 	ctx context.Context,
 	fn func(ctx context.Context, idx int, store *DriveStore) listFreshResult,
@@ -419,13 +549,32 @@ func (p *MailboxPool) fanOutListFresh(
 		wg.Add(1)
 		go func(idx int, store *DriveStore) {
 			defer wg.Done()
+			start := time.Now()
 			r := fn(ctx, idx, store)
 			r.idx = idx
+			r.duration = time.Since(start)
 			results[idx] = r
 		}(i, s)
 	}
 	wg.Wait()
 	return results
+}
+
+// logSlowMailboxes emits one log line per mailbox whose callback exceeded
+// slowMailboxListThreshold. The op argument identifies the call site
+// (e.g. "list_fresh", "list_fresh_status") so operators can distinguish
+// which API surface is dragging. Quiet by default: nothing is logged when
+// every mailbox is below the threshold, so steady-state operation does not
+// spam the journal.
+func (p *MailboxPool) logSlowMailboxes(op string, parts []listFreshResult) {
+	if p == nil || p.logger == nil {
+		return
+	}
+	for _, r := range parts {
+		if r.duration >= slowMailboxListThreshold {
+			p.logger.Printf("mailbox pool: slow %s mailbox[%d] duration=%s err=%v", op, r.idx, r.duration.Round(time.Millisecond), r.err)
+		}
+	}
 }
 
 func (p *MailboxPool) ListFresh(ctx context.Context, prefix string, since time.Time) ([]ObjectInfo, error) {
@@ -436,6 +585,7 @@ func (p *MailboxPool) ListFresh(ctx context.Context, prefix string, since time.T
 		objs, err := s.ListFresh(ctx, prefix, since)
 		return listFreshResult{objects: objs, err: err}
 	})
+	p.logSlowMailboxes("list_fresh", parts)
 	results := make([]ObjectInfo, 0, 64)
 	seen := make(map[string]struct{}, 64)
 	var firstErr error
@@ -480,6 +630,7 @@ func (p *MailboxPool) ListFreshStatus(ctx context.Context, prefix string, since 
 			err:        err,
 		}
 	})
+	p.logSlowMailboxes("list_fresh_status", parts)
 	merged := ObjectListInfo{}
 	seen := make(map[string]struct{}, 64)
 	var firstErr error
@@ -547,6 +698,7 @@ func (p *MailboxPool) ListFreshContainsPageStatus(ctx context.Context, contains 
 			err:        err,
 		}
 	})
+	p.logSlowMailboxes("list_fresh_contains", parts)
 	merged := ObjectListInfo{}
 	seen := make(map[string]struct{}, len(contains))
 	var firstErr error
