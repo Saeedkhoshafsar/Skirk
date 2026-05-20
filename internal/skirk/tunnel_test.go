@@ -2071,6 +2071,106 @@ func TestPriorityMuxDownloadSkipsHedgeWhenLimiterHasNoSpareCapacity(t *testing.T
 	}
 }
 
+// TestNormalMuxDownloadHedgesSlowFirstAttempt verifies that normal (non-priority)
+// traffic now benefits from the hedged retry path: when the first download
+// blocks past muxNormalDownloadHedge, a second attempt is fired and returns
+// the bytes, instead of the receive loop stalling until the gap repair
+// machinery kicks in.
+func TestNormalMuxDownloadHedgesSlowFirstAttempt(t *testing.T) {
+	store := &hedgedObjectStore{firstExited: make(chan struct{})}
+	tunnel := &Tunnel{
+		Data:                store,
+		DownloadConcurrency: 8,
+		Profile:             "auto",
+		role:                "client",
+	}
+	mux := &driveMux{t: tunnel}
+
+	started := time.Now()
+	// Priority: false → must hit the new normal-traffic hedge path.
+	sealed, err := mux.downloadMuxObject(context.Background(), muxObjectMeta{Name: "obj", ID: "file-id", Priority: false})
+	if err != nil {
+		t.Fatalf("download mux object: %v", err)
+	}
+	if string(sealed) != "hedged" {
+		t.Fatalf("sealed = %q, want hedged response", sealed)
+	}
+	// The normal hedge fires at muxNormalDownloadHedge (~400ms). Anything
+	// north of the priority hedge (1500ms) would mean we silently fell
+	// back to priority timings.
+	if elapsed := time.Since(started); elapsed >= muxPriorityDownloadHedge {
+		t.Fatalf("normal hedged download took %s, want under priority hedge delay %s", elapsed, muxPriorityDownloadHedge)
+	}
+	if got := store.calls.Load(); got < 2 {
+		t.Fatalf("store calls = %d, want normal traffic to fire a hedged second attempt", got)
+	}
+
+	select {
+	case <-store.firstExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first hedged attempt did not exit after winner canceled the hedge")
+	}
+}
+
+// TestNormalMuxDownloadSkipsHedgeWhenLimiterSaturated verifies that the new
+// normal-traffic hedge still honours canHedgeDownload(): when the adaptive
+// limiter reports no spare capacity, we fall back to a single attempt and do
+// not amplify load.
+func TestNormalMuxDownloadSkipsHedgeWhenLimiterSaturated(t *testing.T) {
+	store := &configurableSlowStore{delay: muxNormalDownloadHedge + 200*time.Millisecond, body: []byte("slow")}
+	tunnel := &Tunnel{
+		Data:                store,
+		DownloadConcurrency: 1, // limit=1 → CanHedge returns false (needs ≥2 spare slots).
+		Profile:             "auto",
+		role:                "client",
+	}
+	mux := &driveMux{t: tunnel}
+
+	sealed, err := mux.downloadMuxObject(context.Background(), muxObjectMeta{Name: "obj", ID: "file-id", Priority: false})
+	if err != nil {
+		t.Fatalf("download mux object: %v", err)
+	}
+	if string(sealed) != "slow" {
+		t.Fatalf("sealed = %q, want slow first response", sealed)
+	}
+	if got := store.calls.Load(); got != 1 {
+		t.Fatalf("store calls = %d, want no hedge under saturated download limiter", got)
+	}
+}
+
+// configurableSlowStore is like slowFirstObjectStore but with an externally
+// configurable delay so we can test the normal-traffic hedge path without
+// inheriting the priority-hedge timing constants.
+type configurableSlowStore struct {
+	calls atomic.Int32
+	delay time.Duration
+	body  []byte
+}
+
+func (s *configurableSlowStore) Put(context.Context, string, []byte) error { return nil }
+
+func (s *configurableSlowStore) Get(ctx context.Context, name string) ([]byte, error) {
+	return s.GetByID(ctx, name)
+}
+
+func (s *configurableSlowStore) List(context.Context, string) ([]ObjectInfo, error) {
+	return nil, nil
+}
+
+func (s *configurableSlowStore) Delete(context.Context, string) error { return nil }
+
+func (s *configurableSlowStore) GetByID(ctx context.Context, _ string) ([]byte, error) {
+	s.calls.Add(1)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(s.delay):
+		return s.body, nil
+	}
+}
+
+func (s *configurableSlowStore) DeleteID(context.Context, string) error { return nil }
+
 type hedgedObjectStore struct {
 	calls       atomic.Int32
 	firstExited chan struct{}

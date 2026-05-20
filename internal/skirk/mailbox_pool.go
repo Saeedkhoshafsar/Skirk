@@ -385,28 +385,77 @@ func (p *MailboxPool) GetObjectRangeByID(ctx context.Context, fileID string, sta
 
 // --- FreshListStore et al. ----------------------------------------------
 
+// listFreshResult holds one mailbox's slice of objects (or its error) along
+// with whatever paging metadata the caller asked for. We use the same struct
+// for plain ListFresh (which only needs Objects) and ListFreshStatus (which
+// also folds Pages/Truncated/Incomplete bits), so a single fan-out helper
+// can serve both call sites.
+type listFreshResult struct {
+	idx        int
+	objects    []ObjectInfo
+	pages      int
+	truncated  bool
+	incomplete bool
+	err        error
+}
+
+// fanOutListFresh runs fn against every mailbox in parallel and returns the
+// per-mailbox results in stable order (matching p.stores). It is the building
+// block behind ListFresh/ListFreshStatus/ListFreshContainsPageStatus so that
+// total wall-clock latency tracks the slowest mailbox rather than the sum of
+// all mailbox latencies.
+//
+// Each goroutine receives its mailbox index and the underlying store; the
+// returned error is recorded per-mailbox (rather than aborting the fan-out)
+// so a single transient failure on one mailbox does not mask fresh data on
+// the others.
+func (p *MailboxPool) fanOutListFresh(
+	ctx context.Context,
+	fn func(ctx context.Context, idx int, store *DriveStore) listFreshResult,
+) []listFreshResult {
+	results := make([]listFreshResult, len(p.stores))
+	var wg sync.WaitGroup
+	for i, s := range p.stores {
+		wg.Add(1)
+		go func(idx int, store *DriveStore) {
+			defer wg.Done()
+			r := fn(ctx, idx, store)
+			r.idx = idx
+			results[idx] = r
+		}(i, s)
+	}
+	wg.Wait()
+	return results
+}
+
 func (p *MailboxPool) ListFresh(ctx context.Context, prefix string, since time.Time) ([]ObjectInfo, error) {
 	if len(p.stores) == 1 {
 		return p.stores[0].ListFresh(ctx, prefix, since)
 	}
+	parts := p.fanOutListFresh(ctx, func(ctx context.Context, idx int, s *DriveStore) listFreshResult {
+		objs, err := s.ListFresh(ctx, prefix, since)
+		return listFreshResult{objects: objs, err: err}
+	})
 	results := make([]ObjectInfo, 0, 64)
 	seen := make(map[string]struct{}, 64)
 	var firstErr error
-	for i, s := range p.stores {
-		objs, err := s.ListFresh(ctx, prefix, since)
-		if err != nil {
+	// Iterate in mailbox-index order so duplicate detection and recordID
+	// preserve the same "first mailbox that saw this ID wins" semantics as
+	// the previous sequential implementation.
+	for _, r := range parts {
+		if r.err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("mailbox[%d] list fresh: %w", i, err)
+				firstErr = fmt.Errorf("mailbox[%d] list fresh: %w", r.idx, r.err)
 			}
 			continue
 		}
-		for _, o := range objs {
+		for _, o := range r.objects {
 			if o.ID != "" {
 				if _, dup := seen[o.ID]; dup {
 					continue
 				}
 				seen[o.ID] = struct{}{}
-				p.recordID(o.ID, i)
+				p.recordID(o.ID, r.idx)
 			}
 			results = append(results, o)
 		}
@@ -421,27 +470,36 @@ func (p *MailboxPool) ListFreshStatus(ctx context.Context, prefix string, since 
 	if len(p.stores) == 1 {
 		return p.stores[0].ListFreshStatus(ctx, prefix, since)
 	}
+	parts := p.fanOutListFresh(ctx, func(ctx context.Context, idx int, s *DriveStore) listFreshResult {
+		page, err := s.ListFreshStatus(ctx, prefix, since)
+		return listFreshResult{
+			objects:    page.Objects,
+			pages:      page.Pages,
+			truncated:  page.Truncated,
+			incomplete: page.Incomplete,
+			err:        err,
+		}
+	})
 	merged := ObjectListInfo{}
 	seen := make(map[string]struct{}, 64)
 	var firstErr error
-	for i, s := range p.stores {
-		page, err := s.ListFreshStatus(ctx, prefix, since)
-		if err != nil {
+	for _, r := range parts {
+		if r.err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("mailbox[%d] list fresh status: %w", i, err)
+				firstErr = fmt.Errorf("mailbox[%d] list fresh status: %w", r.idx, r.err)
 			}
 			continue
 		}
-		merged.Pages += page.Pages
-		merged.Truncated = merged.Truncated || page.Truncated
-		merged.Incomplete = merged.Incomplete || page.Incomplete
-		for _, o := range page.Objects {
+		merged.Pages += r.pages
+		merged.Truncated = merged.Truncated || r.truncated
+		merged.Incomplete = merged.Incomplete || r.incomplete
+		for _, o := range r.objects {
 			if o.ID != "" {
 				if _, dup := seen[o.ID]; dup {
 					continue
 				}
 				seen[o.ID] = struct{}{}
-				p.recordID(o.ID, i)
+				p.recordID(o.ID, r.idx)
 			}
 			merged.Objects = append(merged.Objects, o)
 		}
@@ -479,27 +537,36 @@ func (p *MailboxPool) ListFreshContainsPageStatus(ctx context.Context, contains 
 	if pageToken != "" {
 		return ObjectListInfo{}, nil
 	}
+	parts := p.fanOutListFresh(ctx, func(ctx context.Context, idx int, s *DriveStore) listFreshResult {
+		page, err := s.ListFreshContainsPageStatus(ctx, contains, since, "", maxPages)
+		return listFreshResult{
+			objects:    page.Objects,
+			pages:      page.Pages,
+			truncated:  page.Truncated,
+			incomplete: page.Incomplete,
+			err:        err,
+		}
+	})
 	merged := ObjectListInfo{}
 	seen := make(map[string]struct{}, len(contains))
 	var firstErr error
-	for i, s := range p.stores {
-		page, err := s.ListFreshContainsPageStatus(ctx, contains, since, "", maxPages)
-		if err != nil {
+	for _, r := range parts {
+		if r.err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("mailbox[%d] list fresh contains: %w", i, err)
+				firstErr = fmt.Errorf("mailbox[%d] list fresh contains: %w", r.idx, r.err)
 			}
 			continue
 		}
-		merged.Pages += page.Pages
-		merged.Truncated = merged.Truncated || page.Truncated
-		merged.Incomplete = merged.Incomplete || page.Incomplete
-		for _, o := range page.Objects {
+		merged.Pages += r.pages
+		merged.Truncated = merged.Truncated || r.truncated
+		merged.Incomplete = merged.Incomplete || r.incomplete
+		for _, o := range r.objects {
 			if o.ID != "" {
 				if _, dup := seen[o.ID]; dup {
 					continue
 				}
 				seen[o.ID] = struct{}{}
-				p.recordID(o.ID, i)
+				p.recordID(o.ID, r.idx)
 			}
 			merged.Objects = append(merged.Objects, o)
 		}
