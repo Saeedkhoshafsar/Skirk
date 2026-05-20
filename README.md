@@ -362,6 +362,35 @@ modulo pool size), so client and exit pick the same mailbox without
 negotiation. Omitting `extra_mailboxes` keeps the previous single-mailbox code
 path byte-for-byte.
 
+#### Managing mailboxes from the CLI
+
+You do not have to hand-edit `exit.json` and `client.json` to grow or shrink
+the mailbox pool. The `skirk mailbox` subcommands wrap the manual flow:
+
+```bash
+# Show every mailbox in the kit and whether it is the primary or an extra.
+skirk mailbox list --kit skirk-kit
+
+# Sign in to another Google account and append it as an extra mailbox.
+# Updates exit.json, client.json, regenerates client.skirk, and restarts the
+# exit service on Linux. Use --restart-exit=false to skip the restart.
+skirk mailbox add --kit skirk-kit --oauth-mode personal --label alt2
+
+# Remove an extra mailbox by label or 1-based index. Old client.skirk
+# profiles stop working after this; reissue the new client.skirk.
+skirk mailbox remove --kit skirk-kit --label alt2
+
+# Make an extra mailbox the new primary (the old primary becomes an extra
+# at the slot the promoted mailbox vacated, so lane order is preserved).
+skirk mailbox promote --kit skirk-kit --label alt1
+
+# Rebuild client.skirk from client.json if you hand-edited the kit.
+skirk mailbox regenerate-client --kit skirk-kit
+```
+
+The operator menu (`skirk` with no arguments) exposes the same actions under
+"Manage Drive mailboxes (add, remove, list)".
+
 ## Documentation
 
 - [Install Guide](docs/install.md)

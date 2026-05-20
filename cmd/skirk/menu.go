@@ -27,11 +27,12 @@ func menu(ctx context.Context) error {
 		fmt.Println("4. Run client SOCKS in this terminal")
 		fmt.Println("5. Run optional desktop dashboard")
 		fmt.Println("6. Manage exit service")
-		fmt.Println("7. Revoke, clean, or delete kit")
-		fmt.Println("8. Update installed Skirk")
-		fmt.Println("9. Show commands")
+		fmt.Println("7. Manage Drive mailboxes (add, remove, list)")
+		fmt.Println("8. Revoke, clean, or delete kit")
+		fmt.Println("9. Update installed Skirk")
+		fmt.Println("10. Show commands")
 		if runtime.GOOS == "linux" {
-			fmt.Println("10. Uninstall Skirk from this Linux machine")
+			fmt.Println("11. Uninstall Skirk from this Linux machine")
 		}
 		fmt.Println("0. Quit")
 		choice, err := prompt(ctx, reader, "Select", "1")
@@ -81,6 +82,10 @@ func menu(ctx context.Context) error {
 				return err
 			}
 		case "7":
+			if err := mailboxMenu(ctx, reader); err != nil {
+				fmt.Fprintf(os.Stderr, "mailbox menu: %v\n", err)
+			}
+		case "8":
 			config, err := prompt(ctx, reader, "Exit config", "skirk-kit/exit.json")
 			if err != nil {
 				return err
@@ -125,13 +130,13 @@ func menu(ctx context.Context) error {
 					return err
 				}
 			}
-		case "8":
+		case "9":
 			if err := updateFromMenu(ctx, reader); err != nil {
 				return err
 			}
-		case "9":
-			usage()
 		case "10":
+			usage()
+		case "11":
 			if runtime.GOOS != "linux" {
 				fmt.Println("Unknown selection")
 				continue

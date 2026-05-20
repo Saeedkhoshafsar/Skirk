@@ -81,6 +81,8 @@ func run(args []string) error {
 		return cleanup(ctx, args[2:])
 	case "repair-mailbox":
 		return repairMailbox(ctx, args[2:])
+	case "mailbox":
+		return mailboxCommand(ctx, args[2:])
 	case "config":
 		return configCommand(args[2:])
 	case "service":
@@ -121,6 +123,11 @@ func usage() {
   cleanup --config skirk-kit/exit.json --older-than 2h [--delete]
   cleanup --config skirk-kit/exit.json --all --older-than 1ns --delete
   repair-mailbox --kit skirk-kit [--start-exit]
+  mailbox list [--kit skirk-kit]
+  mailbox add --kit skirk-kit [--label NAME] [--oauth-mode easy|personal]
+  mailbox remove --kit skirk-kit (--label NAME | --index N) [--yes]
+  mailbox promote --kit skirk-kit (--label NAME | --index N) [--yes]
+  mailbox regenerate-client --kit skirk-kit
   service install --config skirk-kit/exit.json [--name skirk-exit]
   service status|start|stop|restart|uninstall [--name skirk-exit]
   uninstall --dry-run
