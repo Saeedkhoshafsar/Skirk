@@ -134,6 +134,13 @@ func newCLIMailboxOps() web.MailboxOps {
 
 func (cliMailboxOps) List(kitDir string) ([]web.MailboxInfo, error) {
 	exitPath := resolveKitExitPath(kitDir, "")
+	// A brand-new kit directory does not have an exit.json yet (the operator
+	// may have just pointed `skirk web` at an empty folder). Returning a
+	// clean empty list lets the UI render its "no mailboxes yet" hint
+	// instead of bubbling up a 500 from a missing-file error.
+	if _, statErr := os.Stat(exitPath); errors.Is(statErr, os.ErrNotExist) {
+		return []web.MailboxInfo{}, nil
+	}
 	cfg, err := skirk.LoadConfig(exitPath)
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", exitPath, err)

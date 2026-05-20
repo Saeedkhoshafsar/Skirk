@@ -169,6 +169,28 @@ func waitFor(url string, timeout time.Duration) bool {
 	return false
 }
 
+// TestCLIMailboxOps_ListEmptyKit verifies that pointing `skirk web` at a
+// freshly-created (empty) kit directory does not surface a 500 error from
+// the missing exit.json — the UI's "no mailboxes yet" state needs a clean
+// empty slice instead. Regression test for the step 2-a fix.
+func TestCLIMailboxOps_ListEmptyKit(t *testing.T) {
+	dir := t.TempDir()
+	ops := newCLIMailboxOps()
+	got, err := ops.List(dir)
+	if err != nil {
+		t.Fatalf("unexpected error listing empty kit: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected non-nil empty slice, got nil")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 mailboxes from empty kit, got %d", len(got))
+	}
+	// And the type-asserted concrete return shouldn't be web.MailboxInfo's
+	// zero-value singleton — we want a real empty slice serialised as [].
+	var _ []web.MailboxInfo = got
+}
+
 func itoa(i int) string {
 	// Tiny stdlib-free int-to-string so the test file doesn't need strconv.
 	if i == 0 {
